@@ -54,9 +54,7 @@ def get_pattern_triggers(
     return []
 
 
-# =====================================================================
-# Narrow Range Break (NRB)
-# =====================================================================
+
 
 
 def _detect_narrow_range_break(queryset, nrb_lookback: int):
@@ -126,9 +124,6 @@ def _format_nrb_trigger(row):
     }
 
 
-# =====================================================================
-# Bowl (Rounded Bottom) Pattern
-# =====================================================================
 
 
 def _detect_bowl_pattern(queryset):
