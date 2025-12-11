@@ -3,7 +3,7 @@ from datetime import datetime, date, timedelta
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from django.db.models import Q
+from django.db.models import Q, Max
 from marketdata.models import Symbol, EodPrice, Parameter
 from api.serializers import SymbolSerializer
 from core.pattern_recognition import (
@@ -197,12 +197,9 @@ class PriceHistoryView(APIView):
         cutoff_date = date.today() - timedelta(days=years * 365)
 
         # ✅ use symbol__symbol and trade_date
-        price_queryset = (
-            EodPrice.objects.filter(
-                symbol__symbol=scrip, trade_date__gte=cutoff_date
-            )
-            .order_by("trade_date")
-        )
+        price_queryset = EodPrice.objects.filter(
+            symbol__symbol=scrip, trade_date__gte=cutoff_date
+        ).order_by("trade_date")
 
         price_data = [
             {
@@ -222,6 +219,46 @@ class PriceHistoryView(APIView):
                 "scrip": scrip,
                 "price_data": price_data,
                 "records": len(price_data),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class Week52HighView(APIView):
+    def get(self, request, *args, **kwargs):
+        scrip = request.query_params.get("scrip")
+
+        if not scrip:
+            return Response(
+                {"error": "Query parameter 'scrip' is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Calculate cutoff date: 52 weeks ago (365 days)
+        cutoff_date = date.today() - timedelta(days=365)
+
+        # ✅ use symbol__symbol and trade_date; get maximum high price
+        week52_high_result = EodPrice.objects.filter(
+            symbol__symbol=scrip, trade_date__gte=cutoff_date
+        ).aggregate(week52_high=Max("high"))
+
+        week52_high = week52_high_result.get("week52_high")
+
+        if week52_high is None:
+            return Response(
+                {
+                    "scrip": scrip,
+                    "week52_high": None,
+                    "message": "No price data found for the past 52 weeks.",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        return Response(
+            {
+                "scrip": scrip,
+                "week52_high": float(week52_high),
+                "cutoff_date": cutoff_date.isoformat(),
             },
             status=status.HTTP_200_OK,
         )

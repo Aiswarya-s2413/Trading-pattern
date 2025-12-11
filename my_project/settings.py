@@ -37,6 +37,7 @@ INSTALLED_APPS = [
     'corsheaders',
 
     # Local apps
+    'marketdata',
     'api',
     'core',
 ]
@@ -82,7 +83,7 @@ DATABASES = {
         'USER': 'trading_user',
         'PASSWORD': 'trading_password',
         'HOST': 'localhost',
-        'PORT': '5432',   
+        'PORT': '5433',   
     }
 }
 
@@ -135,11 +136,7 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5174",
 ]
-STATIC_ROOT = BASE_DIR / 'staticfiles'
 
-STATICFILES_DIRS = [
-    BASE_DIR / 'static',
-]
 
 
 
