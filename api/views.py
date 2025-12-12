@@ -1,33 +1,111 @@
 from datetime import datetime, date, timedelta
-
+from django.core.cache import cache
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from django.db.models import Q, Max
-from marketdata.models import Symbol, EodPrice, Parameter
-from api.serializers import SymbolSerializer
+from django.utils.timezone import now
+from marketdata.models import Symbol, EodPrice, Parameter, Index, IndexPrice
 from core.pattern_recognition import (
     get_pattern_triggers,
     BOWL_MIN_DURATION_DAYS,
     NRB_LOOKBACK,
 )
 
+from .serializers import SymbolListItemSerializer
+from .pagination import SymbolPagination
+from .utils import relevance
+
 
 class SymbolListView(APIView):
-    def get(self, request, *args, **kwargs):
-        query = request.query_params.get("q")
+    """
+    Unified symbol + index search with pagination + sector info.
+    """
 
-        qs = Symbol.objects.all()
+    pagination_class = SymbolPagination
+
+    def get(self, request, *args, **kwargs):
+        query = request.query_params.get("q", "").strip()
+
+        # ================================
+        # 1. Load Symbols (with sector)
+        # ================================
+        symbol_qs = (
+            Symbol.objects
+            .filter(eodprice__isnull=False)
+            .distinct()
+        )
 
         if query:
-            qs = qs.filter(
-                Q(symbol__icontains=query) | Q(company_name__icontains=query)
+            symbol_qs = symbol_qs.filter(
+                Q(symbol__icontains=query) |
+                Q(company_name__icontains=query) |
+                Q(sector__name__icontains=query)
             )
 
-        qs = qs.order_by("symbol")
+        symbol_qs = symbol_qs.values(
+            "id",
+            "symbol",
+            "company_name",
+            "sector__name",
+            "sector_id",
+        )
 
-        serializer = SymbolSerializer(qs, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        symbol_list = [
+            {
+                "id": s["id"],
+                "symbol": s["symbol"],
+                "name": s["company_name"] or s["symbol"],
+                "sector": s["sector__name"],
+                "sector_id": s["sector_id"],
+                "type": "symbol",
+            }
+            for s in symbol_qs
+        ]
+
+        # ================================
+        # 2. Load Indices
+        # ================================
+        index_qs = (
+            Index.objects
+            .filter(indexprice__isnull=False)
+            .distinct()
+        )
+
+        if query:
+            index_qs = index_qs.filter(
+                Q(symbol__icontains=query) |
+                Q(name__icontains=query)
+            )
+
+        index_qs = index_qs.values("id", "symbol", "name")
+
+        index_list = [
+            {
+                "id": idx["id"],
+                "symbol": idx["symbol"],
+                "name": idx["name"],
+                "sector": None,
+                "sector_id": None,
+                "type": "index",
+            }
+            for idx in index_qs
+        ]
+
+        # ================================
+        # 3. Merge & Sort (using relevance)
+        # ================================
+        combined = symbol_list + index_list
+        combined = sorted(combined, key=lambda x: relevance(x, query))
+
+        # ================================
+        # 4. Pagination
+        # ================================
+        paginator = self.pagination_class()
+        paginated_data = paginator.paginate_queryset(combined, request)
+
+        serializer = SymbolListItemSerializer(paginated_data, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 
 class PatternScanView(APIView):
@@ -48,6 +126,7 @@ class PatternScanView(APIView):
             series = series_param.strip().lower() if series_param else None
 
             if not scrip or not pattern:
+                print("Scrip and Pattern are required.", scrip, pattern)
                 return Response(
                     {"error": "Scrip and Pattern are required."},
                     status=status.HTTP_400_BAD_REQUEST,
@@ -174,7 +253,17 @@ class PatternScanView(APIView):
 
 
 class PriceHistoryView(APIView):
+    """
+    Fetch historical OHLC price data for a given scrip (Symbol or Index).
+    """
+
+    CACHE_TIMEOUT = 60 * 60 * 24   # 24 hours
+
     def get(self, request, *args, **kwargs):
+
+        # ================================
+        # Validate Inputs
+        # ================================
         scrip = request.query_params.get("scrip")
         years_raw = request.query_params.get("years", 10)
 
@@ -188,76 +277,164 @@ class PriceHistoryView(APIView):
             years = int(years_raw)
             if years <= 0:
                 raise ValueError
-        except (TypeError, ValueError):
+        except:
             return Response(
-                {"error": "Query parameter 'years' must be a positive integer."},
+                {"error": "'years' must be a positive integer."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         cutoff_date = date.today() - timedelta(days=years * 365)
 
-        # ✅ use symbol__symbol and trade_date
-        price_queryset = EodPrice.objects.filter(
-            symbol__symbol=scrip, trade_date__gte=cutoff_date
-        ).order_by("trade_date")
+        # ================================
+        # Caching Layer
+        # ================================
+        cache_key = f"price-history:{scrip}:{years}"
+        cached = cache.get(cache_key)
+        if cached:
+            return Response(cached, status=status.HTTP_200_OK)
 
+        # ================================
+        # Determine if scrip is a Symbol or Index
+        # ================================
+        symbol_obj = Symbol.objects.filter(symbol=scrip).first()
+        index_obj = Index.objects.filter(symbol=scrip).first()
+
+        if not symbol_obj and not index_obj:
+            return Response(
+                {"error": f"No stock or index found with symbol '{scrip}'."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # ================================
+        # Query the correct price table
+        # ================================
+        if symbol_obj:
+            price_qs = (
+                EodPrice.objects
+                .filter(symbol=symbol_obj, trade_date__gte=cutoff_date)
+                .order_by("trade_date")
+                .values("trade_date", "open", "high", "low", "close")
+            )
+        else:
+            price_qs = (
+                IndexPrice.objects
+                .filter(index=index_obj, trade_date__gte=cutoff_date)
+                .order_by("trade_date")
+                .values("trade_date", "open", "high", "low", "close")
+            )
+
+        if not price_qs.exists():
+            return Response(
+                {"error": "No price data for the given scrip in the selected date range."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # ================================
+        # Serialize data
+        # ================================
         price_data = [
             {
-                "time": int(
-                    datetime.combine(row.trade_date, datetime.min.time()).timestamp()
-                ),
-                "open": row.open,
-                "high": row.high,
-                "low": row.low,
-                "close": row.close,
+                "time": int(datetime.combine(row["trade_date"], datetime.min.time()).timestamp()),
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
             }
-            for row in price_queryset
+            for row in price_qs
         ]
 
-        return Response(
-            {
-                "scrip": scrip,
-                "price_data": price_data,
-                "records": len(price_data),
-            },
-            status=status.HTTP_200_OK,
-        )
+        response = {
+            "scrip": scrip,
+            "price_data": price_data,
+            "records": len(price_data),
+        }
+
+        # Store in cache
+        cache.set(cache_key, response, timeout=self.CACHE_TIMEOUT)
+
+        return Response(response, status=status.HTTP_200_OK)
+
 
 
 class Week52HighView(APIView):
-    def get(self, request, *args, **kwargs):
-        scrip = request.query_params.get("scrip")
+    """
+    Returns the 52-week high for a scrip.
+    Supports both Symbol (stocks) and Index (Sensex, Nifty500).
+    """
 
+    def get(self, request, *args, **kwargs):
+        # -----------------------------------------
+        # 1. Validate Input
+        # -----------------------------------------
+        scrip = request.query_params.get("scrip")
         if not scrip:
             return Response(
                 {"error": "Query parameter 'scrip' is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Calculate cutoff date: 52 weeks ago (365 days)
+        # -----------------------------------------
+        # 2. Compute cutoff date (52 weeks)
+        # -----------------------------------------
         cutoff_date = date.today() - timedelta(days=365)
 
-        # ✅ use symbol__symbol and trade_date; get maximum high price
-        week52_high_result = EodPrice.objects.filter(
-            symbol__symbol=scrip, trade_date__gte=cutoff_date
-        ).aggregate(week52_high=Max("high"))
+        # -----------------------------------------
+        # 3. Check if scrip is a STOCK
+        # -----------------------------------------
+        stock_exists = Symbol.objects.filter(symbol=scrip).exists()
 
-        week52_high = week52_high_result.get("week52_high")
+        if stock_exists:
+            data = (
+                EodPrice.objects.filter(
+                    symbol__symbol=scrip,
+                    trade_date__gte=cutoff_date
+                )
+                .aggregate(week52_high=Max("high"))
+            )
+        else:
+            # -----------------------------------------
+            # 4. Check if scrip is an INDEX
+            # -----------------------------------------
+            index_exists = Index.objects.filter(symbol=scrip).exists()
+
+            if not index_exists:
+                return Response(
+                    {
+                        "error": f"'{scrip}' is not a valid symbol or index.",
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            data = (
+                IndexPrice.objects.filter(
+                    index__symbol=scrip,
+                    trade_date__gte=cutoff_date
+                )
+                .aggregate(week52_high=Max("high"))
+            )
+
+        # -----------------------------------------
+        # 5. Extract result
+        # -----------------------------------------
+        week52_high = data.get("week52_high")
 
         if week52_high is None:
             return Response(
                 {
                     "scrip": scrip,
-                    "week52_high": None,
+                    "52week_high": None,
                     "message": "No price data found for the past 52 weeks.",
                 },
                 status=status.HTTP_200_OK,
             )
 
+        # -----------------------------------------
+        # 6. Return Response
+        # -----------------------------------------
         return Response(
             {
                 "scrip": scrip,
-                "week52_high": float(week52_high),
+                "52week_high": float(week52_high),
                 "cutoff_date": cutoff_date.isoformat(),
             },
             status=status.HTTP_200_OK,

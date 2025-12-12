@@ -15,7 +15,7 @@ DEBUG = True
 
 ALLOWED_HOSTS = [
     "trading.aiswaryasathyan.space",
-    "16.176.164.217",
+    "3.27.8.157",
     "localhost",
     "127.0.0.1",
 ]
@@ -83,7 +83,7 @@ DATABASES = {
         'USER': 'trading_user',
         'PASSWORD': 'trading_password',
         'HOST': 'localhost',
-        'PORT': '5433',   
+        'PORT': '5432',
     }
 }
 
@@ -135,20 +135,8 @@ CORS_ALLOW_CREDENTIALS = True
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5174",
+    "https://trading.aiswaryasathyan.space",
 ]
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
