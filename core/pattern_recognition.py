@@ -27,10 +27,10 @@ NRB_LOOKBACK = 7
 def get_pattern_triggers(
     scrip: str,
     pattern: str,
-    nrb_lookback: int,   # kept for backward-compatibility; ignored for NRB now
+    nrb_lookback: int,
     success_rate: float,
-    weeks: int = 20,     # <-- this is the "N" in NRn (NR4, NR7, NR52,...)
-    series: str | None = None,  # <-- which series to use for NRB (None = price)
+    weeks: int = 20,
+    series: str | None = None,
 ):
     """
     Main entry to compute pattern triggers for a given symbol and pattern type.
@@ -40,47 +40,25 @@ def get_pattern_triggers(
 
     For NRB, additional fields are attached:
       - direction: "Bullish Break"
-      - range_low, range_high                # N-week regime support/resistance
-      - range_start_time, range_end_time     # regime time span
-      - nrb_id                               # regime identifier
-      - nr_high, nr_low                      # NR week’s own high/low
+      - range_low, range_high
+      - range_start_time, range_end_time
+      - nrb_id
 
     For Bowl, additional:
       - pattern_id
-
-    SERIES BEHAVIOR (NRB only):
-
-      - series is None / "price" / "close":
-          * Use daily OHLC from EodPrice (default).
-          * NRB is based on price candles and breakout above N-week HIGH.
-
-      - series in {"ema21", "ema50", "ema200", "rsc30", "rsc500"}:
-          * Use daily values from Parameter table.
-          * Weekly regime is built from that series.
-          * Breakout is when that series crosses above its N-week high.
     """
-    # Normalize series string
     series_normalized = (series or "").strip().lower()
 
-   
-    #   NARROW RANGE BREAK (NRn)
-   
     if pattern == "Narrow Range Break":
 
         # CASE 1: DEFAULT – use price candles (EodPrice)
         if series_normalized in ("", "price", "close", "closing_price"):
-            # NOTE: symbol is a ForeignKey; scrip is symbol string (e.g. "RELIANCE.NS")
             base_queryset = EodPrice.objects.filter(symbol__symbol=scrip)
-
-            # Build weekly candles (price-based)
             weekly_qs = get_weekly_queryset(base_queryset)
             total_weeks = weekly_qs.count()
 
-            # n = number of WEEKLY candles we look at for NRn.
-            # This comes from frontend `weeks`, with a fallback.
             nr_weeks = weeks if weeks and weeks > 0 else NRB_LOOKBACK
 
-            # Need at least n weekly candles + 1 breakout candle
             if total_weeks < nr_weeks + 2:
                 return []
 
@@ -93,19 +71,14 @@ def get_pattern_triggers(
             if not weekly_data:
                 return []
 
-            # Step 1: detect NRn + breakout on WEEKLY data (price-based)
-            triggers = _detect_narrow_range_break_python(weekly_data, nr_weeks)
-
-            # Step 2: refine each NRB to the EXACT DAILY breakout candle
-            #         where daily CLOSE first > N-week resistance (range_high).
+            # ROLLING-BASED detection
+            triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks)
             triggers = _attach_daily_breakout_times_price(base_queryset, triggers)
 
-            # Filter by success rate (we now default score=0.0, so success_rate>0 will filter all out)
             return triggers
 
-        # CASE 2: PARAMETER-BASED SERIES (EMA21 / EMA50 / EMA200 / RSC30 / RSC500)
+        # CASE 2: PARAMETER-BASED SERIES
         else:
-            # Map acceptable series names to Parameter model fields
             PARAM_FIELD_MAP = {
                 "ema21": "ema21",
                 "ema50": "ema50",
@@ -116,10 +89,8 @@ def get_pattern_triggers(
 
             series_field = PARAM_FIELD_MAP.get(series_normalized)
             if not series_field:
-                # Unknown series → gracefully fallback to no triggers
                 return []
 
-            # Parameter-based queryset for this symbol
             param_qs = (
                 Parameter.objects
                 .filter(symbol__symbol=scrip)
@@ -127,7 +98,6 @@ def get_pattern_triggers(
                 .order_by("trade_date")
             )
 
-            # Build weekly "candles" for the chosen series (from Parameter)
             weekly_qs = (
                 param_qs
                 .annotate(week=TruncWeek("trade_date"))
@@ -135,9 +105,8 @@ def get_pattern_triggers(
                 .annotate(
                     high=Max(series_field),
                     low=Min(series_field),
-                    close=Max(series_field),  # not really used in logic
-                    date=Max("trade_date"),   # last date in that week
-                    # no is_successful_trade here → score will default to 0.0
+                    close=Max(series_field),
+                    date=Max("trade_date"),
                 )
                 .order_by("week")
             )
@@ -154,23 +123,15 @@ def get_pattern_triggers(
             if not weekly_data:
                 return []
 
-            # Step 1: detect NRn + breakout on WEEKLY data (series-based)
-            triggers = _detect_narrow_range_break_python(weekly_data, nr_weeks)
-
-            # Step 2: refine each NRB to the EXACT DAILY breakout candle
-            #         where the DAILY SERIES value first > N-week resistance.
+            # ROLLING-BASED detection
+            triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks)
             triggers = _attach_daily_breakout_times_parameter(
                 param_qs, series_field, triggers
             )
 
-            # For Parameter-series, we currently ignore success_rate (no score field).
             return triggers
 
-  
-    # BOWL
-
     elif pattern == "Bowl":
-        # For Bowl, we now base EMA50 on Parameter table
         param_qs = (
             Parameter.objects
             .filter(symbol__symbol=scrip)
@@ -182,13 +143,9 @@ def get_pattern_triggers(
     return []
 
 
-#  WEEKLY CANDLE BUILDER
-
-
 def get_weekly_queryset(base_queryset):
     """
     Converts daily EodPrice rows into weekly OHLC candles.
-    Each row in the result represents ONE WEEK.
     """
     return (
         base_queryset.annotate(week=TruncWeek("trade_date"))
@@ -198,46 +155,41 @@ def get_weekly_queryset(base_queryset):
             high=Max("high"),
             low=Min("low"),
             close=Max("close"),
-            date=Max("trade_date"),  # last date in that week
-            # is_successful_trade removed in new schema; score defaults to 0.0
+            date=Max("trade_date"),
         )
         .order_by("week")
     )
 
 
-#  NARROW RANGE LOGIC
-
-
-def _detect_narrow_range_break_python(weekly_data: list, nrb_lookback: int):
+def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int):
     """
-    Detects NRn (Narrow Range n) on WEEKLY data, in a *regime* style.
-    Intended logic:
-
-      - Regime = last n weekly candles.
-      - Resistance = highest HIGH in that n-week regime.
-        For n=52, this is the 52-week high.
-      - NRn week = the week in that regime with the SMALLEST range (high-low).
-      - Breakout = the FIRST WEEK (within a small lookahead window) whose HIGH
-                   crosses ABOVE that resistance (high > resistance).
-                   Only upside, no bearish breaks.
-
-      - After a breakout, that regime is OVER.
-        We must then wait another full n weeks before looking for a new NRn.
-
-    NOTE: This function returns breakout time as the WEEKLY breakout candle’s
-    date. A separate helper refines this to the EXACT DAILY candle where the
-    DAILY CLOSE/value first > resistance.
-
-    - weekly_data: list of weekly OHLC-like rows (each row = one week)
-    - nrb_lookback: n in NRn (e.g. 4, 7, 10, 52)
+    ROLLING-BASED NRB Detection.
+    
+    Logic:
+    - For each week i (starting from week N), look back at the last N weeks [i-N+1 to i]
+    - Find the highest HIGH in those N weeks (resistance)
+    - Find the lowest LOW in those N weeks (support)
+    - Check if the VERY NEXT week (i+1) breaks above resistance (HIGH > resistance)
+    - If yes, record the breakout
+    - Move to next week and repeat (no cooldown, continuous sliding window)
+    
+    Example with N=52:
+    - Week 52: Check weeks 1-52, resistance = highest HIGH in weeks 1-52
+              If week 53 breaks above, record it
+    - Week 53: Check weeks 2-53, resistance = highest HIGH in weeks 2-53
+              If week 54 breaks above, record it
+    - Week 54: Check weeks 3-54, and so on...
+    
+    Parameters:
+    - weekly_data: list of weekly OHLC rows
+    - nrb_lookback: N (number of weeks in the rolling window, e.g., 52)
+    
+    Returns:
+    - List of breakout triggers with resistance/support levels
     """
-
-    # Need at least n weekly candles + 1 breakout candle
+    
     if len(weekly_data) < nrb_lookback + 1:
         return []
-
-    preceding_rows = max(nrb_lookback - 1, 0)
-    result = []
 
     rows = [
         {
@@ -245,134 +197,85 @@ def _detect_narrow_range_break_python(weekly_data: list, nrb_lookback: int):
             "high": float(row["high"]),
             "low": float(row["low"]),
             "close": float(row["close"]),
-            # new schema has no is_successful_trade -> default to 0.0
             "is_successful_trade": float(row.get("is_successful_trade") or 0.0),
         }
         for row in weekly_data
     ]
 
     n = len(rows)
+    result = []
+    nrb_id = 1
 
-    # Index of the last breakout candle (by WEEK index).
-    # We enforce a cooldown of n weeks after this index.
-    last_breakout_idx = -1
-    nrb_id = 1  # identifier to group each narrow-range regime
-
-    # How many weeks we allow for breakout after the NR week
-    BREAKOUT_LOOKAHEAD_WEEKS = 12
-
-    for i in range(preceding_rows, n - 1):
-        # REGIME / COOLDOWN LOGIC
-        # Ensure the full n-week window [i-(n-1) .. i] is AFTER the last breakout.
-        if last_breakout_idx != -1 and i < last_breakout_idx + nrb_lookback:
-            # Still inside cooldown → skip
+    # Start from week N (index N-1 in 0-based indexing)
+    # We need at least 1 more week after the N-week window for breakout check
+    for i in range(nrb_lookback - 1, n - 1):
+        
+        # Define the N-week window: [i-N+1, i]
+        window_start = i - nrb_lookback + 1
+        window_end = i + 1  # exclusive in Python slicing
+        
+        if window_start < 0:
             continue
-
-        # Range of the current NRn candidate week (NR week)
-        nr_high = rows[i]["high"]
-        nr_low = rows[i]["low"]
-        spread = nr_high - nr_low
-
-        # Window of the last n weeks (including i)
-        window_start = max(0, i - preceding_rows)
-        window_end = i + 1  # inclusive of i
-
-        # Compute narrowest range in that n-week window
-        # And the regime's support/resistance (min low, max high)
-        min_spread = float("inf")
-        range_high = float("-inf")  # resistance (N-week high)
-        range_low = float("inf")    # support  (N-week low)
-
-        for j in range(window_start, window_end):
-            r = rows[j]
-            r_spread = r["high"] - r["low"]
-            if r_spread < min_spread:
-                min_spread = r_spread
-            if r["high"] > range_high:
-                range_high = r["high"]
-            if r["low"] < range_low:
-                range_low = r["low"]
-
-        # We only care if current week has the smallest range in the last n weeks
-        if spread != min_spread:
+        
+        # Get the N weeks in this window
+        window_weeks = rows[window_start:window_end]
+        
+        # Calculate resistance (highest HIGH) and support (lowest LOW) in this N-week window
+        range_high = max(week["high"] for week in window_weeks)
+        range_low = min(week["low"] for week in window_weeks)
+        
+        # Check the NEXT week (i+1) for breakout
+        breakout_idx = i + 1
+        
+        if breakout_idx >= n:
+            # No next week available
             continue
-
-        # We have an NRn week at index i.
-        # Now look ahead up to BREAKOUT_LOOKAHEAD_WEEKS to find first HIGH > resistance.
-        resistance = range_high  # N-week high
-        breakout_idx = None
-
-        # Look ahead from i+1 to i+BREAKOUT_LOOKAHEAD_WEEKS
-        lookahead_end = min(n, i + 1 + BREAKOUT_LOOKAHEAD_WEEKS)
-        for k in range(i + 1, lookahead_end):
-            if rows[k]["high"] > resistance:
-                breakout_idx = k
-                break
-
-        if breakout_idx is None:
-            # No breakout in the lookahead window → skip this NRn
-            continue
-
-        breakout_row = rows[breakout_idx]
-        breakout_date = breakout_row["date"]
-        candle_break = "Bullish Break"  # only bullish breakouts
-        score = breakout_row["is_successful_trade"]
-
-        trigger_ts = int(
-            datetime.combine(breakout_date, datetime.min.time()).timestamp()
-        )
-
-        # Regime covers the n-week window (for drawing horizontal lines).
-        regime_start_ts = int(
-            datetime.combine(rows[window_start]["date"], datetime.min.time()).timestamp()
-        )
-        # We end at the breakout week for a nice visual box up to breakout.
-        regime_end_ts = int(
-            datetime.combine(breakout_date, datetime.min.time()).timestamp()
-        )
-
-        result.append({
-            # NOTE: this is the WEEKLY breakout time,
-            # will be refined to DAILY in _attach_daily_breakout_times_* helpers.
-            "time": trigger_ts,
-            "score": score,
-            "direction": candle_break,
-            # extra fields for plotting the narrow range box/lines
-            "range_low": range_low,
-            "range_high": range_high,
-            "range_start_time": regime_start_ts,
-            "range_end_time": regime_end_ts,
-            "nrb_id": nrb_id,
-            # store NR week high/low (for debugging / future use)
-            "nr_high": nr_high,
-            "nr_low": nr_low,
-        })
-
-        # Mark this breakout index and start a new regime AFTER n more weeks.
-        last_breakout_idx = breakout_idx
-        nrb_id += 1
+        
+        breakout_week = rows[breakout_idx]
+        
+        # NRB condition: Next week's HIGH breaks above N-week resistance
+        if breakout_week["high"] > range_high:
+            # Breakout found!
+            breakout_date = breakout_week["date"]
+            score = breakout_week["is_successful_trade"]
+            
+            trigger_ts = int(
+                datetime.combine(breakout_date, datetime.min.time()).timestamp()
+            )
+            
+            regime_start_ts = int(
+                datetime.combine(rows[window_start]["date"], datetime.min.time()).timestamp()
+            )
+            regime_end_ts = int(
+                datetime.combine(breakout_date, datetime.min.time()).timestamp()
+            )
+            
+            result.append({
+                "time": trigger_ts,  # Breakout week timestamp
+                "score": score,
+                "direction": "Bullish Break",
+                "range_low": range_low,
+                "range_high": range_high,
+                "range_start_time": regime_start_ts,
+                "range_end_time": regime_end_ts,
+                "nrb_id": nrb_id,
+            })
+            
+            nrb_id += 1
 
     return result
 
 
-
-#   DAILY REFINEMENT HELPERS
-
 def _attach_daily_breakout_times_price(base_queryset, triggers):
     """
-    Refine each NRB trigger (price-based) from WEEKLY breakout time to the
-    EXACT DAILY candle inside that breakout week where the DAILY CLOSE first
-    crosses ABOVE the N-week resistance (range_high).
-
-    - base_queryset: EodPrice.objects.filter(symbol__symbol=...)
-    - triggers: list of dicts returned from _detect_narrow_range_break_python
+    Refine each NRB trigger from WEEKLY breakout time to the EXACT DAILY candle
+    where the DAILY CLOSE first crosses ABOVE the resistance.
     """
     if not triggers:
         return triggers
 
     for t in triggers:
         direction = t.get("direction")
-        # Use the regime resistance level (N-week high) as breakout threshold
         resistance = t.get("range_high")
         weekly_breakout_ts = t.get("time")
 
@@ -385,14 +288,9 @@ def _attach_daily_breakout_times_price(base_queryset, triggers):
 
         resistance = float(resistance)
 
-        # Convert weekly breakout ts -> date (end of that breakout week)
         breakout_week_end_date = datetime.fromtimestamp(weekly_breakout_ts).date()
-
-        # Approximate start of that week as 6 days before the end date
-        # (covers Mon-Sun; trading days will be subset)
         week_start_date = breakout_week_end_date - timedelta(days=6)
 
-        # Fetch all DAILY candles in that breakout week
         daily_qs = (
             base_queryset
             .filter(trade_date__gte=week_start_date, trade_date__lte=breakout_week_end_date)
@@ -401,14 +299,12 @@ def _attach_daily_breakout_times_price(base_queryset, triggers):
 
         breakout_daily_date = None
 
-        # Bullish NRB: first daily CLOSE > resistance (N-week high)
         for row in daily_qs:
             close_f = float(row.close)
             if close_f > resistance:
                 breakout_daily_date = row.trade_date
                 break
 
-        # If we found a daily breakout, update the trigger time
         if breakout_daily_date is not None:
             t["time"] = int(
                 datetime.combine(breakout_daily_date, datetime.min.time()).timestamp()
@@ -419,13 +315,8 @@ def _attach_daily_breakout_times_price(base_queryset, triggers):
 
 def _attach_daily_breakout_times_parameter(param_qs, value_field: str, triggers):
     """
-    Refine each NRB trigger (Parameter-based series) from WEEKLY breakout time
-    to the EXACT DAILY candle inside that breakout week where the DAILY
-    SERIES value first crosses ABOVE the N-week resistance (range_high).
-
-    - param_qs: Parameter.objects.filter(symbol__symbol=..., [series_field not null])
-    - value_field: one of {"ema21", "ema50", "ema200", "rsc30", "rsc500"}
-    - triggers: list of dicts returned from _detect_narrow_range_break_python
+    Refine each NRB trigger from WEEKLY breakout time to the EXACT DAILY candle
+    where the DAILY SERIES value first crosses ABOVE the resistance.
     """
     if not triggers:
         return triggers
@@ -447,7 +338,6 @@ def _attach_daily_breakout_times_parameter(param_qs, value_field: str, triggers)
         breakout_week_end_date = datetime.fromtimestamp(weekly_breakout_ts).date()
         week_start_date = breakout_week_end_date - timedelta(days=6)
 
-        # Fetch all DAILY Parameter rows in that breakout week
         daily_qs = (
             param_qs
             .filter(trade_date__gte=week_start_date, trade_date__lte=breakout_week_end_date)
@@ -472,17 +362,11 @@ def _attach_daily_breakout_times_parameter(param_qs, value_field: str, triggers)
     return triggers
 
 
-
-#  BOWL PATTERN
-
-
 def _detect_bowl_pattern(queryset):
     """
     Bowl detection based on EMA 50 stored in Parameter table.
-
-    - queryset: Parameter.objects.filter(symbol__symbol=..., ema50__isnull=False)
+    (Bowl logic remains unchanged)
     """
-    # Build a normalized list of rows with consistent keys
     raw_rows = list(
         queryset
         .annotate(timestamp=Extract("trade_date", "epoch"))
@@ -518,7 +402,6 @@ def _detect_bowl_pattern(queryset):
 
         ema_i = rows[i]["ema"]
 
-        # Local bottom check
         is_local_min = all(
             rows[j]["ema"] > ema_i
             for j in range(i - BOWL_LOCAL_MIN_WINDOW_DAYS, i + BOWL_LOCAL_MIN_WINDOW_DAYS + 1)
@@ -528,7 +411,6 @@ def _detect_bowl_pattern(queryset):
         if not is_local_min:
             continue
 
-        # Find rims (left & right high points in EMA)
         left_start, left_end = clamp(
             i - BOWL_LEFT_LOOKBACK_MAX_DAYS,
             i - BOWL_LEFT_LOOKBACK_MIN_DAYS,
@@ -554,23 +436,19 @@ def _detect_bowl_pattern(queryset):
         left_ema = rows[left_idx]["ema"]
         right_ema = rows[right_idx]["ema"]
 
-        # Total duration of the bowl
         total_days = (rows[right_idx]["date"] - rows[left_idx]["date"]).days
         if total_days < BOWL_MIN_TOTAL_DAYS:
             continue
 
-        # Depth check
         depth_left = (left_ema - ema_i) / left_ema
         depth_right = (right_ema - ema_i) / right_ema
 
         if depth_left < BOWL_MIN_DEPTH or depth_right < BOWL_MIN_DEPTH:
             continue
 
-        # Rim symmetry
         if min(left_ema, right_ema) / max(left_ema, right_ema) < (1.0 - BOWL_RIM_TOLERANCE):
             continue
 
-        # Breakout above rim
         rim_level = max(left_ema, right_ema)
         breakout = None
         for k in range(
@@ -585,10 +463,8 @@ def _detect_bowl_pattern(queryset):
             continue
 
         last_used = breakout
-        # new schema has no is_successful_trade -> fixed score
         score = 1.0
 
-        # Mark three points of the bowl: left rim, bottom, right rim
         result.append({
             "time": int(rows[left_idx]["timestamp"]),
             "score": score,
