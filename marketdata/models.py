@@ -65,6 +65,11 @@ class Parameter(models.Model):
     rsc30 = models.DecimalField(max_digits=12, decimal_places=4, null=True)
     rsc500 = models.DecimalField(max_digits=12, decimal_places=4, null=True)
 
+    # New RSC fields (Pine Script logic - SENSEX only)
+    rsc_sensex_ratio = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)  # Gray line
+    rsc_sensex_ema5 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)   # Red line
+    rsc_sensex_ema10 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)  # Blue line
+
     ema21 = models.DecimalField(max_digits=12, decimal_places=4, null=True)
     ema50 = models.DecimalField(max_digits=12, decimal_places=4, null=True)
     ema200 = models.DecimalField(max_digits=12, decimal_places=4, null=True)

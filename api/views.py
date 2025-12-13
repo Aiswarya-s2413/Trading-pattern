@@ -138,7 +138,6 @@ class PatternScanView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # ✅ use symbol__symbol; no EMA_50 on EodPrice now
         total_rows = EodPrice.objects.filter(symbol__symbol=scrip).count()
         ema_rows = Parameter.objects.filter(
             symbol__symbol=scrip, ema50__isnull=False
@@ -153,7 +152,6 @@ class PatternScanView(APIView):
             series=series,
         )
 
-        # ✅ use symbol__symbol and trade_date
         ohlcv_qs = EodPrice.objects.filter(symbol__symbol=scrip).order_by("trade_date")
         ohlcv_data = [
             {
@@ -170,35 +168,94 @@ class PatternScanView(APIView):
 
         # ----- series_data for Parameter-based filters -----
         series_data = []
+        series_data_ema5 = []
+        series_data_ema10 = []
+        
         valid_series_fields = {
             "ema21": "ema21",
             "ema50": "ema50",
             "ema200": "ema200",
-            "rsc30": "rsc30",
+            "rsc30": "rsc_sensex_ratio",
             "rsc500": "rsc500",
         }
 
         if series in valid_series_fields:
             field_name = valid_series_fields[series]
-            param_qs = (
-                Parameter.objects.filter(symbol__symbol=scrip)
-                .exclude(**{f"{field_name}__isnull": True})
-                .order_by("trade_date")
-            )
+            
+            if series == "rsc30":
+                param_qs = (
+                    Parameter.objects.filter(symbol__symbol=scrip)
+                    .exclude(rsc_sensex_ratio__isnull=True)
+                    .order_by("trade_date")
+                )
 
-            series_data = [
-                {
-                    "time": int(
-                        datetime.combine(
-                            row.trade_date, datetime.min.time()
-                        ).timestamp()
-                    ),
-                    "value": getattr(row, field_name),
-                }
-                for row in param_qs
-            ]
+                # GRAY LINE - Raw ratio
+                series_data = [
+                    {
+                        "time": int(
+                            datetime.combine(
+                                row.trade_date, datetime.min.time()
+                            ).timestamp()
+                        ),
+                        "value": float(row.rsc_sensex_ratio),
+                    }
+                    for row in param_qs
+                    if row.rsc_sensex_ratio is not None
+                ]
+
+                # RED LINE - EMA5
+                series_data_ema5 = [
+                    {
+                        "time": int(
+                            datetime.combine(
+                                row.trade_date, datetime.min.time()
+                            ).timestamp()
+                        ),
+                        "value": float(row.rsc_sensex_ema5),
+                    }
+                    for row in param_qs
+                    if row.rsc_sensex_ema5 is not None
+                ]
+
+                # BLUE LINE - EMA10
+                series_data_ema10 = [
+                    {
+                        "time": int(
+                            datetime.combine(
+                                row.trade_date, datetime.min.time()
+                            ).timestamp()
+                        ),
+                        "value": float(row.rsc_sensex_ema10),
+                    }
+                    for row in param_qs
+                    if row.rsc_sensex_ema10 is not None
+                ]
+            else:
+                param_qs = (
+                    Parameter.objects.filter(symbol__symbol=scrip)
+                    .exclude(**{f"{field_name}__isnull": True})
+                    .order_by("trade_date")
+                )
+
+                series_data = [
+                    {
+                        "time": int(
+                            datetime.combine(
+                                row.trade_date, datetime.min.time()
+                            ).timestamp()
+                        ),
+                        "value": float(getattr(row, field_name)),
+                    }
+                    for row in param_qs
+                ]
 
         # ----- markers -----
+        # 🆕 Build a lookup map for RSC values if series == rsc30
+        rsc_lookup = {}
+        if series == "rsc30" and series_data:
+            for point in series_data:
+                rsc_lookup[point["time"]] = point["value"]
+
         markers = []
         for row in trigger_markers:
             score = row.get("score", 0.0)
@@ -209,6 +266,32 @@ class PatternScanView(APIView):
             else:
                 text = f"Pattern: {pattern} | Success Score: {score:.2f}"
 
+            # 🆕 Convert range_high/range_low to RSC scale if needed
+            range_low = row.get("range_low")
+            range_high = row.get("range_high")
+            
+            if series == "rsc30" and range_low is not None and range_high is not None:
+                # Find the RSC value at range_start_time and range_end_time
+                range_start_time = row.get("range_start_time")
+                range_end_time = row.get("range_end_time")
+                
+                # Get average RSC during the range period
+                if range_start_time and range_end_time:
+                    rsc_values_in_range = [
+                        v for t, v in rsc_lookup.items() 
+                        if range_start_time <= t <= range_end_time
+                    ]
+                    if rsc_values_in_range:
+                        avg_rsc = sum(rsc_values_in_range) / len(rsc_values_in_range)
+                        # Scale the range proportionally
+                        # If price range was 3200-3300 (100 points)
+                        # And current RSC avg is 0.05
+                        # Then RSC range should be around 0.05 ± some variation
+                        
+                        # Simple approach: use min/max RSC in range
+                        range_low = min(rsc_values_in_range) if rsc_values_in_range else range_low
+                        range_high = max(rsc_values_in_range) if rsc_values_in_range else range_high
+
             markers.append(
                 {
                     "time": row["time"],
@@ -217,8 +300,8 @@ class PatternScanView(APIView):
                     "shape": "circle",
                     "text": text,
                     "pattern_id": pattern_id,
-                    "range_low": row.get("range_low"),
-                    "range_high": row.get("range_high"),
+                    "range_low": range_low,
+                    "range_high": range_high,
                     "range_start_time": row.get("range_start_time"),
                     "range_end_time": row.get("range_end_time"),
                     "nrb_id": row.get("nrb_id"),
@@ -235,6 +318,8 @@ class PatternScanView(APIView):
             "markers": markers,
             "series": series,
             "series_data": series_data,
+            "series_data_ema5": series_data_ema5,
+            "series_data_ema10": series_data_ema10,
             "debug": {
                 "total_rows": total_rows,
                 "ema_rows": ema_rows,
@@ -246,11 +331,12 @@ class PatternScanView(APIView):
                 "nrb_default_lookback": NRB_LOOKBACK,
                 "series_param": series,
                 "series_data_points": len(series_data),
+                "series_data_ema5_points": len(series_data_ema5),
+                "series_data_ema10_points": len(series_data_ema10),
             },
         }
 
         return Response(response_data, status=status.HTTP_200_OK)
-
 
 class PriceHistoryView(APIView):
     """
