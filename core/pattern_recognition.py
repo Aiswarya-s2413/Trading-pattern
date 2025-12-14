@@ -22,6 +22,8 @@ BOWL_BREAKOUT_LOOKAHEAD_DAYS = 120
 # Default NRB window if frontend doesn't send a valid weeks value
 NRB_LOOKBACK = 7
 
+# Default cooldown period in weeks
+DEFAULT_COOLDOWN_WEEKS = 4
 
 
 def get_pattern_triggers(
@@ -31,6 +33,7 @@ def get_pattern_triggers(
     success_rate: float,
     weeks: int = 20,
     series: str | None = None,
+    cooldown_weeks: int = DEFAULT_COOLDOWN_WEEKS,
 ):
     """
     Main entry to compute pattern triggers for a given symbol and pattern type.
@@ -46,6 +49,9 @@ def get_pattern_triggers(
 
     For Bowl, additional:
       - pattern_id
+      
+    Parameters:
+      - cooldown_weeks: Minimum number of weeks between NRB detections (default: 4)
     """
     series_normalized = (series or "").strip().lower()
 
@@ -71,8 +77,8 @@ def get_pattern_triggers(
             if not weekly_data:
                 return []
 
-            # ROLLING-BASED detection
-            triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks)
+            # ROLLING-BASED detection with cooldown
+            triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             triggers = _attach_daily_breakout_times_price(base_queryset, triggers)
 
             return triggers
@@ -123,8 +129,8 @@ def get_pattern_triggers(
             if not weekly_data:
                 return []
 
-            # ROLLING-BASED detection
-            triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks)
+            # ROLLING-BASED detection with cooldown
+            triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             triggers = _attach_daily_breakout_times_parameter(
                 param_qs, series_field, triggers
             )
@@ -161,31 +167,29 @@ def get_weekly_queryset(base_queryset):
     )
 
 
-def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int):
+def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, cooldown_weeks: int = DEFAULT_COOLDOWN_WEEKS):
     """
-    ROLLING-BASED NRB Detection.
+    ROLLING-BASED NRB Detection with Cooldown Period.
     
     Logic:
     - For each week i (starting from week N), look back at the last N weeks [i-N+1 to i]
     - Find the highest HIGH in those N weeks (resistance)
     - Find the lowest LOW in those N weeks (support)
     - Check if the VERY NEXT week (i+1) breaks above resistance (HIGH > resistance)
-    - If yes, record the breakout
-    - Move to next week and repeat (no cooldown, continuous sliding window)
+    - If yes, record the breakout ONLY if it's beyond the cooldown period from the last breakout
+    - Move to next week and repeat (continuous sliding window with cooldown enforcement)
     
-    Example with N=52:
-    - Week 52: Check weeks 1-52, resistance = highest HIGH in weeks 1-52
-              If week 53 breaks above, record it
-    - Week 53: Check weeks 2-53, resistance = highest HIGH in weeks 2-53
-              If week 54 breaks above, record it
-    - Week 54: Check weeks 3-54, and so on...
+    Cooldown Logic:
+    - After detecting an NRB, the next NRB can only be detected after cooldown_weeks have passed
+    - This prevents detecting multiple NRBs in quick succession
     
     Parameters:
     - weekly_data: list of weekly OHLC rows
     - nrb_lookback: N (number of weeks in the rolling window, e.g., 52)
+    - cooldown_weeks: Minimum number of weeks between NRB detections (default: 4)
     
     Returns:
-    - List of breakout triggers with resistance/support levels
+    - List of breakout triggers with resistance/support levels (filtered by cooldown)
     """
     
     if len(weekly_data) < nrb_lookback + 1:
@@ -205,6 +209,7 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int):
     n = len(rows)
     result = []
     nrb_id = 1
+    last_breakout_idx = None  # Track the index of the last detected breakout
 
     # Start from week N (index N-1 in 0-based indexing)
     # We need at least 1 more week after the N-week window for breakout check
@@ -235,33 +240,38 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int):
         
         # NRB condition: Next week's HIGH breaks above N-week resistance
         if breakout_week["high"] > range_high:
-            # Breakout found!
-            breakout_date = breakout_week["date"]
-            score = breakout_week["is_successful_trade"]
             
-            trigger_ts = int(
-                datetime.combine(breakout_date, datetime.min.time()).timestamp()
-            )
-            
-            regime_start_ts = int(
-                datetime.combine(rows[window_start]["date"], datetime.min.time()).timestamp()
-            )
-            regime_end_ts = int(
-                datetime.combine(breakout_date, datetime.min.time()).timestamp()
-            )
-            
-            result.append({
-                "time": trigger_ts,  # Breakout week timestamp
-                "score": score,
-                "direction": "Bullish Break",
-                "range_low": range_low,
-                "range_high": range_high,
-                "range_start_time": regime_start_ts,
-                "range_end_time": regime_end_ts,
-                "nrb_id": nrb_id,
-            })
-            
-            nrb_id += 1
+            # COOLDOWN CHECK: Only add this breakout if cooldown period has passed
+            if last_breakout_idx is None or (breakout_idx - last_breakout_idx) >= cooldown_weeks:
+                # Breakout found and cooldown satisfied!
+                breakout_date = breakout_week["date"]
+                score = breakout_week["is_successful_trade"]
+                
+                trigger_ts = int(
+                    datetime.combine(breakout_date, datetime.min.time()).timestamp()
+                )
+                
+                regime_start_ts = int(
+                    datetime.combine(rows[window_start]["date"], datetime.min.time()).timestamp()
+                )
+                regime_end_ts = int(
+                    datetime.combine(breakout_date, datetime.min.time()).timestamp()
+                )
+                
+                result.append({
+                    "time": trigger_ts,  # Breakout week timestamp
+                    "score": score,
+                    "direction": "Bullish Break",
+                    "range_low": range_low,
+                    "range_high": range_high,
+                    "range_start_time": regime_start_ts,
+                    "range_end_time": regime_end_ts,
+                    "nrb_id": nrb_id,
+                })
+                
+                # Update tracking variables
+                last_breakout_idx = breakout_idx
+                nrb_id += 1
 
     return result
 

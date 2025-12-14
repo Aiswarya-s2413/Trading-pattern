@@ -10,6 +10,7 @@ from core.pattern_recognition import (
     get_pattern_triggers,
     BOWL_MIN_DURATION_DAYS,
     NRB_LOOKBACK,
+    DEFAULT_COOLDOWN_WEEKS,
 )
 
 from .serializers import SymbolListItemSerializer
@@ -125,6 +126,10 @@ class PatternScanView(APIView):
             series_param = request.query_params.get("series")
             series = series_param.strip().lower() if series_param else None
 
+            # NEW: Get cooldown_weeks from frontend, default to DEFAULT_COOLDOWN_WEEKS
+            cooldown_weeks_param = request.query_params.get("cooldown_weeks")
+            cooldown_weeks = int(cooldown_weeks_param) if cooldown_weeks_param else DEFAULT_COOLDOWN_WEEKS
+
             if not scrip or not pattern:
                 print("Scrip and Pattern are required.", scrip, pattern)
                 return Response(
@@ -134,7 +139,7 @@ class PatternScanView(APIView):
 
         except ValueError:
             return Response(
-                {"error": "Invalid numerical input for success_rate or weeks."},
+                {"error": "Invalid numerical input for success_rate, weeks, or cooldown_weeks."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -150,6 +155,7 @@ class PatternScanView(APIView):
             success_rate=success_rate,
             weeks=weeks,
             series=series,
+            cooldown_weeks=cooldown_weeks,  # Pass cooldown to pattern recognition
         )
 
         ohlcv_qs = EodPrice.objects.filter(symbol__symbol=scrip).order_by("trade_date")
@@ -327,6 +333,7 @@ class PatternScanView(APIView):
                 "markers_created": len(markers),
                 "success_rate_filter": success_rate,
                 "weeks_param": weeks,
+                "cooldown_weeks": cooldown_weeks,  # Include in debug info
                 "bowl_min_duration_days": BOWL_MIN_DURATION_DAYS,
                 "nrb_default_lookback": NRB_LOOKBACK,
                 "series_param": series,
