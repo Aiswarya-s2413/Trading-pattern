@@ -65,7 +65,7 @@ def get_pattern_triggers(
 
             nr_weeks = weeks if weeks and weeks > 0 else NRB_LOOKBACK
 
-            if total_weeks < nr_weeks + 2:
+            if total_weeks < nr_weeks + 1:
                 return []
 
             weekly_data = list(
@@ -89,12 +89,14 @@ def get_pattern_triggers(
                 "ema21": "ema21",
                 "ema50": "ema50",
                 "ema200": "ema200",
-                "rsc30": "rsc30",
-                "rsc500": "rsc500",
+                "rsc30": "rsc_sensex_ratio",        # Frontend sends rsc30, uses rsc_sensex_ratio
+                "rsc_sensex": "rsc_sensex_ratio",   # Alias
+                "rsc_sensex_ratio": "rsc_sensex_ratio",
             }
 
             series_field = PARAM_FIELD_MAP.get(series_normalized)
             if not series_field:
+                print(f"[NRB DEBUG] Unknown series: {series_normalized}")
                 return []
 
             param_qs = (
@@ -103,6 +105,10 @@ def get_pattern_triggers(
                 .exclude(**{f"{series_field}__isnull": True})
                 .order_by("trade_date")
             )
+
+            # DEBUG: Check how many rows we have
+            param_count = param_qs.count()
+            print(f"[NRB DEBUG] Series: {series_normalized}, Field: {series_field}, Rows: {param_count}")
 
             weekly_qs = (
                 param_qs
@@ -118,19 +124,29 @@ def get_pattern_triggers(
             )
 
             total_weeks = weekly_qs.count()
+            print(f"[NRB DEBUG] Total weeks: {total_weeks}")
 
             nr_weeks = weeks if weeks and weeks > 0 else NRB_LOOKBACK
-            if total_weeks < nr_weeks + 2:
+            if total_weeks < nr_weeks + 1:
+                print(f"[NRB DEBUG] Not enough weeks: {total_weeks} < {nr_weeks + 1}")
                 return []
 
             weekly_data = list(
                 weekly_qs.values("date", "high", "low", "close", "week")
             )
+            
             if not weekly_data:
+                print("[NRB DEBUG] No weekly data!")
                 return []
+
+            # DEBUG: Print first few weeks
+            print(f"[NRB DEBUG] First 3 weeks: {weekly_data[:3]}")
+            print(f"[NRB DEBUG] Last 3 weeks: {weekly_data[-3:]}")
 
             # ROLLING-BASED detection with cooldown
             triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
+            print(f"[NRB DEBUG] Triggers found: {len(triggers)}")
+            
             triggers = _attach_daily_breakout_times_parameter(
                 param_qs, series_field, triggers
             )
@@ -172,19 +188,31 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, coo
     ROLLING-BASED NRB Detection with Cooldown Period.
     
     Logic:
-    - For each week i (starting from week N), look back at the last N weeks [i-N+1 to i]
+    - For each candidate week i (starting from week N onwards)
+    - Look back at the PREVIOUS N weeks [i-N, i-1]
     - Find the highest HIGH in those N weeks (resistance)
     - Find the lowest LOW in those N weeks (support)
-    - Check if the VERY NEXT week (i+1) breaks above resistance (HIGH > resistance)
+    - Check if the CURRENT week i breaks above resistance (HIGH > resistance)
     - If yes, record the breakout ONLY if it's beyond the cooldown period from the last breakout
     - Move to next week and repeat (continuous sliding window with cooldown enforcement)
     
+    Example with N=52 weeks:
+    - Week 52 (index 52): Check if it breaks resistance from weeks 0-51
+    - Week 53 (index 53): Check if it breaks resistance from weeks 1-52
+    - And so on...
+    
     Cooldown Logic:
-    - After detecting an NRB, the next NRB can only be detected after cooldown_weeks have passed
+    - After detecting an NRB at week X, the next NRB can only be detected at week X + cooldown_weeks or later
     - This prevents detecting multiple NRBs in quick succession
     
+    For RSC:
+    - HIGH = Max(rsc_sensex_ratio) in the week
+    - LOW = Min(rsc_sensex_ratio) in the week
+    - Resistance = Highest RSC ratio in the N-week window
+    - Breakout = Current week's RSC ratio breaks above resistance
+    
     Parameters:
-    - weekly_data: list of weekly OHLC rows
+    - weekly_data: list of weekly OHLC rows (or RSC high/low for RSC-based NRB)
     - nrb_lookback: N (number of weeks in the rolling window, e.g., 52)
     - cooldown_weeks: Minimum number of weeks between NRB detections (default: 4)
     
@@ -193,6 +221,7 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, coo
     """
     
     if len(weekly_data) < nrb_lookback + 1:
+        print(f"[NRB DEBUG] Not enough data: {len(weekly_data)} < {nrb_lookback + 1}")
         return []
 
     rows = [
@@ -209,18 +238,21 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, coo
     n = len(rows)
     result = []
     nrb_id = 1
-    last_breakout_idx = None  # Track the index of the last detected breakout
+    last_breakout_idx = None
+    
+    # DEBUG counters
+    checks_performed = 0
+    breakouts_found = 0
+    cooldown_blocked = 0
 
-    # Start from week N (index N-1 in 0-based indexing)
-    # We need at least 1 more week after the N-week window for breakout check
-    for i in range(nrb_lookback - 1, n - 1):
+    # Start from week N (index nrb_lookback)
+    for i in range(nrb_lookback, n):
         
-        # Define the N-week window: [i-N+1, i]
-        window_start = i - nrb_lookback + 1
-        window_end = i + 1  # exclusive in Python slicing
+        checks_performed += 1
         
-        if window_start < 0:
-            continue
+        # Define the N-week lookback window: [i-N, i-1]
+        window_start = i - nrb_lookback
+        window_end = i
         
         # Get the N weeks in this window
         window_weeks = rows[window_start:window_end]
@@ -229,20 +261,20 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, coo
         range_high = max(week["high"] for week in window_weeks)
         range_low = min(week["low"] for week in window_weeks)
         
-        # Check the NEXT week (i+1) for breakout
-        breakout_idx = i + 1
+        # Check the CURRENT week (i) for breakout
+        breakout_week = rows[i]
         
-        if breakout_idx >= n:
-            # No next week available
-            continue
+        # DEBUG: Print first few checks
+        if checks_performed <= 3 or (breakout_week["high"] > range_high):
+            print(f"[NRB DEBUG] Week {i}: high={breakout_week['high']:.6f}, resistance={range_high:.6f}, breakout={breakout_week['high'] > range_high}")
         
-        breakout_week = rows[breakout_idx]
-        
-        # NRB condition: Next week's HIGH breaks above N-week resistance
+        # NRB condition: Current week's HIGH breaks above N-week resistance
         if breakout_week["high"] > range_high:
             
-            # COOLDOWN CHECK: Only add this breakout if cooldown period has passed
-            if last_breakout_idx is None or (breakout_idx - last_breakout_idx) >= cooldown_weeks:
+            breakouts_found += 1
+            
+            # COOLDOWN CHECK
+            if last_breakout_idx is None or (i - last_breakout_idx) >= cooldown_weeks:
                 # Breakout found and cooldown satisfied!
                 breakout_date = breakout_week["date"]
                 score = breakout_week["is_successful_trade"]
@@ -255,11 +287,11 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, coo
                     datetime.combine(rows[window_start]["date"], datetime.min.time()).timestamp()
                 )
                 regime_end_ts = int(
-                    datetime.combine(breakout_date, datetime.min.time()).timestamp()
+                    datetime.combine(rows[window_end - 1]["date"], datetime.min.time()).timestamp()
                 )
                 
                 result.append({
-                    "time": trigger_ts,  # Breakout week timestamp
+                    "time": trigger_ts,
                     "score": score,
                     "direction": "Bullish Break",
                     "range_low": range_low,
@@ -269,10 +301,14 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, coo
                     "nrb_id": nrb_id,
                 })
                 
-                # Update tracking variables
-                last_breakout_idx = breakout_idx
+                last_breakout_idx = i
                 nrb_id += 1
+                print(f"[NRB DEBUG] ✓ NRB #{nrb_id-1} detected at week {i}")
+            else:
+                cooldown_blocked += 1
+                print(f"[NRB DEBUG] ✗ Breakout at week {i} blocked by cooldown (last: {last_breakout_idx})")
 
+    print(f"[NRB DEBUG] Summary: checks={checks_performed}, breakouts={breakouts_found}, cooldown_blocked={cooldown_blocked}, result={len(result)}")
     return result
 
 
@@ -280,6 +316,8 @@ def _attach_daily_breakout_times_price(base_queryset, triggers):
     """
     Refine each NRB trigger from WEEKLY breakout time to the EXACT DAILY candle
     where the DAILY CLOSE first crosses ABOVE the resistance.
+    
+    This works for price-based (OHLC) NRB detection.
     """
     if not triggers:
         return triggers
@@ -327,6 +365,9 @@ def _attach_daily_breakout_times_parameter(param_qs, value_field: str, triggers)
     """
     Refine each NRB trigger from WEEKLY breakout time to the EXACT DAILY candle
     where the DAILY SERIES value first crosses ABOVE the resistance.
+    
+    This works for parameter-based (EMA/RSC) NRB detection.
+    For RSC: value_field will be 'rsc_sensex_ratio' (the gray line).
     """
     if not triggers:
         return triggers
