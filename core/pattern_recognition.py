@@ -46,6 +46,7 @@ def get_pattern_triggers(
       - range_low, range_high
       - range_start_time, range_end_time
       - nrb_id
+      - total_nrb_duration_weeks (same for all NRBs - total span)
 
     For Bowl, additional:
       - pattern_id
@@ -80,6 +81,9 @@ def get_pattern_triggers(
             # ROLLING-BASED detection with cooldown
             triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             triggers = _attach_daily_breakout_times_price(base_queryset, triggers)
+            
+            # 🆕 Calculate total NRB duration and attach to all triggers
+            triggers = _calculate_total_nrb_duration(triggers)
 
             return triggers
 
@@ -150,6 +154,9 @@ def get_pattern_triggers(
             triggers = _attach_daily_breakout_times_parameter(
                 param_qs, series_field, triggers
             )
+            
+            # 🆕 Calculate total NRB duration and attach to all triggers
+            triggers = _calculate_total_nrb_duration(triggers)
 
             return triggers
 
@@ -182,6 +189,121 @@ def get_weekly_queryset(base_queryset):
         .order_by("week")
     )
 
+def _calculate_total_nrb_duration(triggers):
+    """
+    Calculate the TOTAL duration from FIRST NRB start to LAST NRB end,
+    considering only CONTIGUOUS NRBs that satisfy the 10% buffer condition.
+    
+    Buffer Logic (Using Breakout Resistance Levels):
+    - For each consecutive pair of NRBs, compare their resistance levels (range_high)
+    - Calculate 20% of the FIRST NRB's resistance level as the buffer
+    - Check if the SECOND NRB's resistance is within 20% of the FIRST
+    - This better captures "price level proximity" rather than range overlap
+    
+    Returns:
+    - triggers with added field: total_nrb_duration_weeks
+    """
+    if not triggers:
+        return triggers
+    
+    # Sort triggers by time to ensure proper ordering
+    sorted_triggers = sorted(triggers, key=lambda t: t.get("time", 0))
+    
+    # Function to check if two NRBs are contiguous (within 10% buffer)
+    def are_contiguous(nrb1, nrb2):
+        resistance1 = nrb1.get("range_high")  # Resistance broken by NRB #1
+        resistance2 = nrb2.get("range_high")  # Resistance broken by NRB #2
+        
+        if resistance1 is None or resistance2 is None:
+            return False
+        
+        # Calculate 20% buffer based on the first NRB's resistance level
+        buffer_threshold = 0.20 * abs(resistance1)
+        
+        # Calculate the absolute difference between resistance levels
+        resistance_diff = abs(resistance2 - resistance1)
+        
+        # Check if the difference is within 20% of the first resistance
+        is_contiguous = resistance_diff <= buffer_threshold
+        
+        if is_contiguous:
+            print(f"[NRB DEBUG] Contiguous: R1={resistance1:.2f}, R2={resistance2:.2f}, diff={resistance_diff:.2f}, buffer={buffer_threshold:.2f}")
+        else:
+            print(f"[NRB DEBUG] NOT Contiguous: R1={resistance1:.2f}, R2={resistance2:.2f}, diff={resistance_diff:.2f} > buffer={buffer_threshold:.2f}")
+        
+        return is_contiguous
+    
+    # Build contiguous groups
+    if not sorted_triggers:
+        for t in triggers:
+            t["total_nrb_duration_weeks"] = None
+        return triggers
+    
+    contiguous_groups = []
+    current_group = [sorted_triggers[0]]
+    
+    for i in range(1, len(sorted_triggers)):
+        if are_contiguous(sorted_triggers[i-1], sorted_triggers[i]):
+            current_group.append(sorted_triggers[i])
+        else:
+            contiguous_groups.append(current_group)
+            current_group = [sorted_triggers[i]]
+    
+    # Don't forget the last group
+    contiguous_groups.append(current_group)
+    
+    print(f"[NRB DEBUG] Found {len(contiguous_groups)} contiguous groups")
+    for idx, group in enumerate(contiguous_groups):
+        if group:
+            first_resistance = group[0].get("range_high", 0)
+            last_resistance = group[-1].get("range_high", 0)
+            print(f"[NRB DEBUG] Group {idx+1}: {len(group)} NRBs, R range: {first_resistance:.2f} to {last_resistance:.2f}")
+    
+    # Find the group with the longest duration
+    longest_group = None
+    max_duration_weeks = 0
+    
+    for group in contiguous_groups:
+        if len(group) < 1:
+            continue
+        
+        # Get start and end times for this group
+        start_time = group[0].get("range_start_time")
+        end_time = group[-1].get("range_end_time")
+        
+        if start_time is not None and end_time is not None:
+            start_date = datetime.fromtimestamp(start_time).date()
+            end_date = datetime.fromtimestamp(end_time).date()
+            
+            total_days = (end_date - start_date).days
+            duration_weeks = total_days // 7
+            
+            if duration_weeks > max_duration_weeks:
+                max_duration_weeks = duration_weeks
+                longest_group = group
+    
+    # Calculate duration for the longest contiguous group
+    total_duration_weeks = None
+    if longest_group and len(longest_group) > 0:
+        earliest_start = longest_group[0].get("range_start_time")
+        latest_end = longest_group[-1].get("range_end_time")
+        
+        if earliest_start is not None and latest_end is not None:
+            start_date = datetime.fromtimestamp(earliest_start).date()
+            end_date = datetime.fromtimestamp(latest_end).date()
+            
+            total_days = (end_date - start_date).days
+            total_duration_weeks = total_days // 7
+            
+            print(f"[NRB DEBUG] Contiguous NRB Duration: {total_days} days = {total_duration_weeks} weeks")
+            print(f"[NRB DEBUG] From {start_date} to {end_date}")
+            print(f"[NRB DEBUG] Contiguous group size: {len(longest_group)} NRBs")
+    
+    # Attach to all triggers
+    for t in triggers:
+        t["total_nrb_duration_weeks"] = total_duration_weeks
+    
+    return triggers
 
 def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, cooldown_weeks: int = DEFAULT_COOLDOWN_WEEKS):
     """

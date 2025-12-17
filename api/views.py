@@ -262,6 +262,14 @@ class PatternScanView(APIView):
             for point in series_data:
                 rsc_lookup[point["time"]] = point["value"]
 
+        # 🆕 Extract total_nrb_duration_weeks (same for all markers)
+        total_nrb_duration_weeks = None
+        if trigger_markers and len(trigger_markers) > 0:
+            total_nrb_duration_weeks = trigger_markers[0].get("total_nrb_duration_weeks")
+        
+        # Debug log to verify
+        print(f"[VIEW DEBUG] Extracted total_nrb_duration_weeks: {total_nrb_duration_weeks}")
+
         markers = []
         for row in trigger_markers:
             score = row.get("score", 0.0)
@@ -326,6 +334,7 @@ class PatternScanView(APIView):
             "series_data": series_data,
             "series_data_ema5": series_data_ema5,
             "series_data_ema10": series_data_ema10,
+            "total_nrb_duration_weeks": total_nrb_duration_weeks,  # 🆕 NEW FIELD at top level
             "debug": {
                 "total_rows": total_rows,
                 "ema_rows": ema_rows,
@@ -333,15 +342,20 @@ class PatternScanView(APIView):
                 "markers_created": len(markers),
                 "success_rate_filter": success_rate,
                 "weeks_param": weeks,
-                "cooldown_weeks": cooldown_weeks,  # Include in debug info
+                "cooldown_weeks": cooldown_weeks,
                 "bowl_min_duration_days": BOWL_MIN_DURATION_DAYS,
                 "nrb_default_lookback": NRB_LOOKBACK,
                 "series_param": series,
                 "series_data_points": len(series_data),
                 "series_data_ema5_points": len(series_data_ema5),
                 "series_data_ema10_points": len(series_data_ema10),
+                "total_nrb_duration_weeks": total_nrb_duration_weeks,  # 🆕 Also in debug
             },
         }
+        
+        # Debug: Print what we're about to send
+        print(f"[VIEW DEBUG] Response data keys: {response_data.keys()}")
+        print(f"[VIEW DEBUG] Response total_nrb_duration_weeks: {response_data.get('total_nrb_duration_weeks')}")
 
         return Response(response_data, status=status.HTTP_200_OK)
 
