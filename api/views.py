@@ -5,6 +5,8 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.db.models import Q, Max
 from django.utils.timezone import now
+from collections import defaultdict
+
 from marketdata.models import Symbol, EodPrice, Parameter, Index, IndexPrice
 from core.pattern_recognition import (
     get_pattern_triggers,
@@ -16,6 +18,80 @@ from core.pattern_recognition import (
 from .serializers import SymbolListItemSerializer
 from .pagination import SymbolPagination
 from .utils import relevance
+
+
+def _calculate_total_nrb_duration(triggers):
+    """
+    Build ALL DISTINCT contiguous NRB groups (non-overlapping).
+    
+    For EACH group:
+      - start_date
+      - end_date
+      - duration in weeks
+    
+    Attach per-trigger:
+      - nrb_group_id
+      - group_start_time
+      - group_end_time
+      - group_duration_weeks
+    """
+    
+    if not triggers:
+        return triggers
+    
+    # Sort by breakout time
+    sorted_triggers = sorted(triggers, key=lambda t: t["time"])
+    
+    def are_contiguous(nrb1, nrb2):
+        """Check if two NRBs are part of same contiguous group"""
+        r1 = nrb1.get("range_high")
+        r2 = nrb2.get("range_high")
+        
+        if r1 is None or r2 is None:
+            return False
+        
+        # Allow 20% tolerance in resistance levels
+        buffer = 0.20 * abs(r1)
+        return abs(r2 - r1) <= buffer
+    
+    # Build contiguous groups
+    contiguous_groups = []
+    current_group = [sorted_triggers[0]]
+    
+    for i in range(1, len(sorted_triggers)):
+        if are_contiguous(sorted_triggers[i - 1], sorted_triggers[i]):
+            current_group.append(sorted_triggers[i])
+        else:
+            # Save current group and start new one
+            contiguous_groups.append(current_group)
+            current_group = [sorted_triggers[i]]
+    
+    # Don't forget the last group
+    contiguous_groups.append(current_group)
+    
+    # Assign group metadata to each trigger
+    for group_id, group in enumerate(contiguous_groups, start=1):
+        start_ts = group[0].get("range_start_time")
+        end_ts = group[-1].get("range_end_time")
+        
+        if start_ts and end_ts:
+            start_date = datetime.fromtimestamp(start_ts).date()
+            end_date = datetime.fromtimestamp(end_ts).date()
+            duration_weeks = (end_date - start_date).days / 7.0  # Use float for precision
+        else:
+            duration_weeks = 0
+        
+        for t in group:
+            t["nrb_group_id"] = group_id
+            t["group_start_time"] = start_ts
+            t["group_end_time"] = end_ts
+            t["group_duration_weeks"] = duration_weeks
+    
+    print(f"[NRB DEBUG] Total NRB groups found: {len(contiguous_groups)}")
+    for i, g in enumerate(contiguous_groups, 1):
+        print(f"  Group {i}: {len(g)} NRBs, Duration: {g[0].get('group_duration_weeks'):.2f} weeks")
+    
+    return triggers
 
 
 class SymbolListView(APIView):
@@ -126,7 +202,7 @@ class PatternScanView(APIView):
             series_param = request.query_params.get("series")
             series = series_param.strip().lower() if series_param else None
 
-            # NEW: Get cooldown_weeks from frontend, default to DEFAULT_COOLDOWN_WEEKS
+            # Get cooldown_weeks from frontend, default to DEFAULT_COOLDOWN_WEEKS
             cooldown_weeks_param = request.query_params.get("cooldown_weeks")
             cooldown_weeks = int(cooldown_weeks_param) if cooldown_weeks_param else DEFAULT_COOLDOWN_WEEKS
 
@@ -148,6 +224,7 @@ class PatternScanView(APIView):
             symbol__symbol=scrip, ema50__isnull=False
         ).count()
 
+        # Get pattern triggers
         trigger_markers = get_pattern_triggers(
             scrip=scrip,
             pattern=pattern,
@@ -155,8 +232,12 @@ class PatternScanView(APIView):
             success_rate=success_rate,
             weeks=weeks,
             series=series,
-            cooldown_weeks=cooldown_weeks,  # Pass cooldown to pattern recognition
+            cooldown_weeks=cooldown_weeks,
         )
+
+        # ✅ FIX: Ensure NRB grouping is calculated for NRB-related patterns
+        if trigger_markers and pattern in ["NRB", "NR4", "NR7"]:
+            trigger_markers = _calculate_total_nrb_duration(trigger_markers)
 
         ohlcv_qs = EodPrice.objects.filter(symbol__symbol=scrip).order_by("trade_date")
         ohlcv_data = [
@@ -255,21 +336,47 @@ class PatternScanView(APIView):
                     for row in param_qs
                 ]
 
-        # ----- markers -----
-        # 🆕 Build a lookup map for RSC values if series == rsc30
+        # ✅ FIX: Build RSC lookup BEFORE processing markers
         rsc_lookup = {}
         if series == "rsc30" and series_data:
             for point in series_data:
                 rsc_lookup[point["time"]] = point["value"]
 
-        # 🆕 Extract total_nrb_duration_weeks (same for all markers)
-        total_nrb_duration_weeks = None
-        if trigger_markers and len(trigger_markers) > 0:
-            total_nrb_duration_weeks = trigger_markers[0].get("total_nrb_duration_weeks")
-        
-        # Debug log to verify
-        print(f"[VIEW DEBUG] Extracted total_nrb_duration_weeks: {total_nrb_duration_weeks}")
+        # ✅ FIX: Extract unique NRB groups using proper grouping
+        nrb_groups = []
+        if trigger_markers:
+            groups_dict = defaultdict(list)
+            
+            for marker in trigger_markers:
+                group_id = marker.get("nrb_group_id")
+                if group_id:
+                    groups_dict[group_id].append(marker)
+            
+            # Build nrb_groups array with proper metadata
+            for group_id in sorted(groups_dict.keys()):
+                group = groups_dict[group_id]
+                first_marker = group[0]
+                
+                # Calculate average range_high for the group
+                valid_range_highs = [m.get("range_high") for m in group if m.get("range_high") is not None]
+                avg_range_high = sum(valid_range_highs) / len(valid_range_highs) if valid_range_highs else None
+                
+                nrb_groups.append({
+                    "group_id": group_id,
+                    "duration_weeks": first_marker.get("group_duration_weeks", 0),
+                    "start_time": first_marker.get("group_start_time"),
+                    "end_time": first_marker.get("group_end_time"),
+                    "num_nrbs": len(group),
+                    "avg_range_high": avg_range_high,
+                })
 
+        # Debug log
+        print(f"[VIEW DEBUG] Extracted {len(nrb_groups)} NRB groups")
+        for g in nrb_groups:
+            duration = g.get('duration_weeks', 0)
+            print(f"  Group {g['group_id']}: {g['num_nrbs']} NRBs, {duration:.2f} weeks")
+
+        # ✅ FIX: Process markers with RSC conversion done once per marker
         markers = []
         for row in trigger_markers:
             score = row.get("score", 0.0)
@@ -280,50 +387,49 @@ class PatternScanView(APIView):
             else:
                 text = f"Pattern: {pattern} | Success Score: {score:.2f}"
 
-            # 🆕 Convert range_high/range_low to RSC scale if needed
+            # Get original range values
             range_low = row.get("range_low")
             range_high = row.get("range_high")
             
+            # ✅ FIX: Convert to RSC scale if needed (make copies to avoid mutation)
             if series == "rsc30" and range_low is not None and range_high is not None:
-                # Find the RSC value at range_start_time and range_end_time
                 range_start_time = row.get("range_start_time")
                 range_end_time = row.get("range_end_time")
                 
-                # Get average RSC during the range period
                 if range_start_time and range_end_time:
+                    # Get RSC values during the range period
                     rsc_values_in_range = [
                         v for t, v in rsc_lookup.items() 
                         if range_start_time <= t <= range_end_time
                     ]
+                    
                     if rsc_values_in_range:
-                        avg_rsc = sum(rsc_values_in_range) / len(rsc_values_in_range)
-                        # Scale the range proportionally
-                        # If price range was 3200-3300 (100 points)
-                        # And current RSC avg is 0.05
-                        # Then RSC range should be around 0.05 ± some variation
-                        
-                        # Simple approach: use min/max RSC in range
-                        range_low = min(rsc_values_in_range) if rsc_values_in_range else range_low
-                        range_high = max(rsc_values_in_range) if rsc_values_in_range else range_high
+                        # Use min/max RSC in range
+                        range_low = min(rsc_values_in_range)
+                        range_high = max(rsc_values_in_range)
 
-            markers.append(
-                {
-                    "time": row["time"],
-                    "position": "aboveBar",
-                    "color": "#2196F3",
-                    "shape": "circle",
-                    "text": text,
-                    "pattern_id": pattern_id,
-                    "range_low": range_low,
-                    "range_high": range_high,
-                    "range_start_time": row.get("range_start_time"),
-                    "range_end_time": row.get("range_end_time"),
-                    "nrb_id": row.get("nrb_id"),
-                    "nr_high": row.get("nr_high"),
-                    "nr_low": row.get("nr_low"),
-                    "direction": row.get("direction"),
-                }
-            )
+            markers.append({
+                "time": row["time"],
+                "position": "aboveBar",
+                "color": "#2196F3",
+                "shape": "circle",
+                "text": text,
+                "pattern_id": pattern_id,
+                "range_low": range_low,
+                "range_high": range_high,
+                "range_start_time": row.get("range_start_time"),
+                "range_end_time": row.get("range_end_time"),
+                "nrb_id": row.get("nrb_id"),
+                "nrb_group_id": row.get("nrb_group_id"),  # Include group ID in marker
+                "nr_high": row.get("nr_high"),
+                "nr_low": row.get("nr_low"),
+                "direction": row.get("direction"),
+            })
+
+        # ✅ FIX: Calculate total duration properly with safe access
+        total_nrb_duration_weeks = sum(
+            g.get("duration_weeks", 0) for g in nrb_groups
+        ) if nrb_groups else 0
 
         response_data = {
             "scrip": scrip,
@@ -334,7 +440,8 @@ class PatternScanView(APIView):
             "series_data": series_data,
             "series_data_ema5": series_data_ema5,
             "series_data_ema10": series_data_ema10,
-            "total_nrb_duration_weeks": total_nrb_duration_weeks,  # 🆕 NEW FIELD at top level
+            "total_nrb_duration_weeks": round(total_nrb_duration_weeks, 2),
+            "nrb_groups": nrb_groups,
             "debug": {
                 "total_rows": total_rows,
                 "ema_rows": ema_rows,
@@ -349,15 +456,17 @@ class PatternScanView(APIView):
                 "series_data_points": len(series_data),
                 "series_data_ema5_points": len(series_data_ema5),
                 "series_data_ema10_points": len(series_data_ema10),
-                "total_nrb_duration_weeks": total_nrb_duration_weeks,  # 🆕 Also in debug
+                "nrb_groups_count": len(nrb_groups),
             },
         }
         
         # Debug: Print what we're about to send
         print(f"[VIEW DEBUG] Response data keys: {response_data.keys()}")
         print(f"[VIEW DEBUG] Response total_nrb_duration_weeks: {response_data.get('total_nrb_duration_weeks')}")
+        print(f"[VIEW DEBUG] Response nrb_groups count: {len(nrb_groups)}")
 
         return Response(response_data, status=status.HTTP_200_OK)
+
 
 class PriceHistoryView(APIView):
     """
@@ -460,7 +569,6 @@ class PriceHistoryView(APIView):
         cache.set(cache_key, response, timeout=self.CACHE_TIMEOUT)
 
         return Response(response, status=status.HTTP_200_OK)
-
 
 
 class Week52HighView(APIView):
