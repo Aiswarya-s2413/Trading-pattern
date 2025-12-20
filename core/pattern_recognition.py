@@ -103,7 +103,14 @@ def get_pattern_triggers(
                 min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
             )
             
-            # Step 3: Assign each NRB to its consolidation zone
+            # Step 3: Calculate success rates for each zone
+            consolidation_zones = _calculate_zone_success_rates(
+                base_queryset,
+                consolidation_zones,
+                series_field='close'
+            )
+            
+            # Step 4: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
             return triggers
@@ -183,7 +190,14 @@ def get_pattern_triggers(
                 min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
             )
             
-            # Step 3: Assign each NRB to its consolidation zone
+            # Step 3: Calculate success rates for each zone
+            consolidation_zones = _calculate_zone_success_rates(
+                param_qs,
+                consolidation_zones,
+                series_field=series_field
+            )
+            
+            # Step 4: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
             return triggers
@@ -216,6 +230,104 @@ def get_weekly_queryset(base_queryset):
         )
         .order_by("week")
     )
+
+
+def _calculate_zone_success_rates(queryset, consolidation_zones, series_field='close'):
+    """
+    🆕 NEW: Calculate post-consolidation success rates for 3, 6, and 12 months.
+    
+    Success is measured as price/value appreciation from zone end value:
+    - 3 months: % change after 90 days
+    - 6 months: % change after 180 days
+    - 12 months: % change after 365 days
+    
+    Parameters:
+    - queryset: EodPrice or Parameter queryset for the symbol
+    - consolidation_zones: List of zone dicts with start_time, end_time
+    - series_field: Field name to use for value calculation
+    
+    Returns:
+    - Updated consolidation_zones with success rate fields added
+    """
+    
+    if not consolidation_zones:
+        return consolidation_zones
+    
+    print(f"[SUCCESS RATE DEBUG] Calculating success rates for {len(consolidation_zones)} zones")
+    
+    # Build a lookup dict: date -> value
+    value_lookup = {}
+    
+    if series_field == 'close':
+        # For EodPrice (price data)
+        for row in queryset.order_by('trade_date'):
+            value_lookup[row.trade_date] = float(row.close)
+    else:
+        # For Parameter data
+        for row in queryset.order_by('trade_date'):
+            value = getattr(row, series_field, None)
+            if value is not None:
+                value_lookup[row.trade_date] = float(value)
+    
+    if not value_lookup:
+        print("[SUCCESS RATE DEBUG] No value data available")
+        return consolidation_zones
+    
+    # Get sorted dates for efficient lookups
+    all_dates = sorted(value_lookup.keys())
+    
+    for zone in consolidation_zones:
+        zone_end_time = zone.get('end_time')
+        if not zone_end_time:
+            continue
+        
+        zone_end_date = datetime.fromtimestamp(zone_end_time).date()
+        
+        # Get the zone end value
+        zone_end_value = value_lookup.get(zone_end_date)
+        if zone_end_value is None:
+            # Try to find the closest date
+            closest_date = min(all_dates, key=lambda d: abs((d - zone_end_date).days), default=None)
+            if closest_date:
+                zone_end_value = value_lookup[closest_date]
+        
+        if zone_end_value is None or zone_end_value == 0:
+            zone['success_rate_3m'] = None
+            zone['success_rate_6m'] = None
+            zone['success_rate_12m'] = None
+            continue
+        
+        # Calculate target dates
+        date_3m = zone_end_date + timedelta(days=90)
+        date_6m = zone_end_date + timedelta(days=180)
+        date_12m = zone_end_date + timedelta(days=365)
+        
+        # Helper function to find closest available value after target date
+        def find_future_value(target_date):
+            # Find dates on or after target date
+            future_dates = [d for d in all_dates if d >= target_date]
+            if not future_dates:
+                return None
+            # Use the first available date at or after target
+            closest_date = future_dates[0]
+            return value_lookup.get(closest_date)
+        
+        # Calculate success rates
+        value_3m = find_future_value(date_3m)
+        value_6m = find_future_value(date_6m)
+        value_12m = find_future_value(date_12m)
+        
+        zone['success_rate_3m'] = round(((value_3m / zone_end_value - 1) * 100), 2) if value_3m else None
+        zone['success_rate_6m'] = round(((value_6m / zone_end_value - 1) * 100), 2) if value_6m else None
+        zone['success_rate_12m'] = round(((value_12m / zone_end_value - 1) * 100), 2) if value_12m else None
+        
+        print(f"[SUCCESS RATE DEBUG] Zone {zone['zone_id']}: "
+              f"End value={zone_end_value:.2f}, "
+              f"3m={zone['success_rate_3m']}%, "
+              f"6m={zone['success_rate_6m']}%, "
+              f"12m={zone['success_rate_12m']}%")
+    
+    return consolidation_zones
 
 
 def _find_consolidation_zones_with_nrb(weekly_data, nrb_triggers, series_field='close', buffer_pct=0.35, min_duration=4):
@@ -375,14 +487,14 @@ def _assign_nrbs_to_zones(triggers, consolidation_zones):
     1. For each NRB trigger
     2. Check which consolidation zone contains the NRB's consolidation period
     3. Assign the NRB to that zone
-    4. Attach zone metadata to the NRB
+    4. Attach zone metadata to the NRB (including success rates)
     
     An NRB belongs to a zone if its consolidation period (range_start_time to range_end_time)
     overlaps with the zone's time period.
     
     Parameters:
     - triggers: List of NRB trigger dicts
-    - consolidation_zones: List of consolidation zone dicts
+    - consolidation_zones: List of consolidation zone dicts (with success rates)
     
     Returns:
     - triggers with zone metadata attached
@@ -434,6 +546,10 @@ def _assign_nrbs_to_zones(triggers, consolidation_zones):
             trigger['zone_avg_value'] = best_zone['avg_value']
             trigger['zone_range_pct'] = best_zone['range_pct']
             trigger['zone_first_value'] = best_zone['first_value']
+            # 🆕 Attach success rates
+            trigger['zone_success_rate_3m'] = best_zone.get('success_rate_3m')
+            trigger['zone_success_rate_6m'] = best_zone.get('success_rate_6m')
+            trigger['zone_success_rate_12m'] = best_zone.get('success_rate_12m')
             
             nrb_id = trigger.get('nrb_id', '?')
             print(f"[NRB ZONE ASSIGNMENT] NRB #{nrb_id} → Zone #{best_zone['zone_id']} "

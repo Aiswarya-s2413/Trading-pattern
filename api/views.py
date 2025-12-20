@@ -285,11 +285,15 @@ class PatternScanView(APIView):
                         "start_time": marker.get("zone_start_time"),
                         "end_time": marker.get("zone_end_time"),
                         "duration_weeks": marker.get("zone_duration_weeks", 0),
-                        "first_value": marker.get("zone_first_value"),  # 🆕 Added first value
+                        "first_value": marker.get("zone_first_value"),
                         "min_value": marker.get("zone_min_value"),
                         "max_value": marker.get("zone_max_value"),
                         "avg_value": marker.get("zone_avg_value"),
                         "range_pct": marker.get("zone_range_pct", 0),
+                        # 🆕 Add success rate fields
+                        "success_rate_3m": marker.get("zone_success_rate_3m"),
+                        "success_rate_6m": marker.get("zone_success_rate_6m"),
+                        "success_rate_12m": marker.get("zone_success_rate_12m"),
                         "num_nrbs": 0,
                     }
                 
@@ -304,8 +308,10 @@ class PatternScanView(APIView):
             print(f"  Zone {g['zone_id']}: {g['num_nrbs']} NRBs, "
                   f"{g['duration_weeks']:.2f} weeks, "
                   f"First value: {g.get('first_value', 'N/A')}, "
-                  f"Range: {g['range_pct']:.1f}%")
-
+                  f"Range: {g['range_pct']:.1f}%, "
+                  f"Success: 3m={g.get('success_rate_3m')}%, "
+                  f"6m={g.get('success_rate_6m')}%, "
+                  f"12m={g.get('success_rate_12m')}%")
         # Process markers
         markers = []
         for row in trigger_markers:
