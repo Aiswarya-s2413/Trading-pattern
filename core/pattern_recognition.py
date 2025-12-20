@@ -25,6 +25,12 @@ NRB_LOOKBACK = 7
 # Default cooldown period in weeks
 DEFAULT_COOLDOWN_WEEKS = 4
 
+# Buffer percentage for consolidation zone detection (30%)
+CONSOLIDATION_BUFFER_PCT = 0.30
+
+# Minimum duration for a valid consolidation zone (in weeks)
+MIN_CONSOLIDATION_DURATION_WEEKS = 4
+
 
 def get_pattern_triggers(
     scrip: str,
@@ -46,7 +52,10 @@ def get_pattern_triggers(
       - range_low, range_high
       - range_start_time, range_end_time
       - nrb_id
-      - total_nrb_duration_weeks (same for all NRBs - total span)
+      - consolidation_zone_id
+      - zone_start_time, zone_end_time
+      - zone_duration_weeks
+      - zone_min_value, zone_max_value, zone_avg_value
 
     For Bowl, additional:
       - pattern_id
@@ -78,12 +87,20 @@ def get_pattern_triggers(
             if not weekly_data:
                 return []
 
-            # ROLLING-BASED detection with cooldown
+            # Step 1: Find ALL consolidation zones in the data
+            consolidation_zones = _find_consolidation_zones(
+                weekly_data, 
+                series_field='close',
+                buffer_pct=CONSOLIDATION_BUFFER_PCT,
+                min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
+            )
+
+            # Step 2: Detect NRB breakouts
             triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             triggers = _attach_daily_breakout_times_price(base_queryset, triggers)
             
-            # 🆕 Calculate total NRB duration and attach to all triggers
-            triggers = _calculate_total_nrb_duration(triggers)
+            # Step 3: Assign each NRB to its consolidation zone
+            triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
             return triggers
 
@@ -93,8 +110,8 @@ def get_pattern_triggers(
                 "ema21": "ema21",
                 "ema50": "ema50",
                 "ema200": "ema200",
-                "rsc30": "rsc_sensex_ratio",        # Frontend sends rsc30, uses rsc_sensex_ratio
-                "rsc_sensex": "rsc_sensex_ratio",   # Alias
+                "rsc30": "rsc_sensex_ratio",
+                "rsc_sensex": "rsc_sensex_ratio",
                 "rsc_sensex_ratio": "rsc_sensex_ratio",
             }
 
@@ -110,7 +127,6 @@ def get_pattern_triggers(
                 .order_by("trade_date")
             )
 
-            # DEBUG: Check how many rows we have
             param_count = param_qs.count()
             print(f"[NRB DEBUG] Series: {series_normalized}, Field: {series_field}, Rows: {param_count}")
 
@@ -143,11 +159,18 @@ def get_pattern_triggers(
                 print("[NRB DEBUG] No weekly data!")
                 return []
 
-            # DEBUG: Print first few weeks
             print(f"[NRB DEBUG] First 3 weeks: {weekly_data[:3]}")
             print(f"[NRB DEBUG] Last 3 weeks: {weekly_data[-3:]}")
 
-            # ROLLING-BASED detection with cooldown
+            # Step 1: Find ALL consolidation zones in the data
+            consolidation_zones = _find_consolidation_zones(
+                weekly_data, 
+                series_field='close',
+                buffer_pct=CONSOLIDATION_BUFFER_PCT,
+                min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
+            )
+
+            # Step 2: Detect NRB breakouts
             triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             print(f"[NRB DEBUG] Triggers found: {len(triggers)}")
             
@@ -155,8 +178,8 @@ def get_pattern_triggers(
                 param_qs, series_field, triggers
             )
             
-            # 🆕 Calculate total NRB duration and attach to all triggers
-            triggers = _calculate_total_nrb_duration(triggers)
+            # Step 3: Assign each NRB to its consolidation zone
+            triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
             return triggers
 
@@ -189,78 +212,292 @@ def get_weekly_queryset(base_queryset):
         .order_by("week")
     )
 
-def _calculate_total_nrb_duration(triggers):
+
+def _find_consolidation_zones(weekly_data, series_field='close', buffer_pct=0.30, min_duration=4):
     """
-    Build ALL DISTINCT contiguous NRB groups (non-overlapping).
+    🆕 NEW FUNCTION: Scan the ENTIRE time series to find ALL consolidation zones
+    where the parameter stays within a specified buffer percentage.
     
-    For EACH group:
-      - start_date
-      - end_date
-      - duration in weeks
+    Algorithm:
+    1. Use a sliding/expanding window approach
+    2. For each starting point, expand the window while values stay within buffer
+    3. When buffer is exceeded, save the zone if it's long enough
+    4. Merge overlapping zones
+    5. Return list of all valid consolidation zones
     
-    Attach per-trigger:
-      - nrb_group_id
-      - group_start_time
-      - group_end_time
-      - group_duration_weeks
+    Parameters:
+    - weekly_data: List of weekly OHLC/parameter data
+    - series_field: 'close' for aggregated weekly value
+    - buffer_pct: Maximum percentage range allowed (default: 30%)
+    - min_duration: Minimum weeks for a valid zone (default: 4)
+    
+    Returns:
+    - List of consolidation zone dicts:
+      {
+          'zone_id': int,
+          'start_idx': int,
+          'end_idx': int,
+          'start_time': timestamp,
+          'end_time': timestamp,
+          'min_value': float,
+          'max_value': float,
+          'avg_value': float,
+          'duration_weeks': float,
+          'range_pct': float
+      }
     """
     
-    if not triggers:
+    if not weekly_data:
+        return []
+    
+    print(f"[CONSOLIDATION ZONE DEBUG] Starting zone detection on {len(weekly_data)} weeks")
+    print(f"[CONSOLIDATION ZONE DEBUG] Buffer: {buffer_pct*100}%, Min duration: {min_duration} weeks")
+    
+    zones = []
+    n = len(weekly_data)
+    used = [False] * n  # Track which weeks are already in a zone
+    
+    # Scan through all possible starting points
+    for start_idx in range(n):
+        
+        if used[start_idx]:
+            continue  # Skip if already part of a zone
+        
+        # Try to expand window from this starting point
+        end_idx = start_idx
+        best_end_idx = start_idx
+        
+        while end_idx < n:
+            # Extract values in current window
+            values_in_window = []
+            for i in range(start_idx, end_idx + 1):
+                val = weekly_data[i].get(series_field)
+                if val is not None:
+                    values_in_window.append(float(val))
+            
+            if not values_in_window:
+                break
+            
+            # Calculate range statistics
+            min_val = min(values_in_window)
+            max_val = max(values_in_window)
+            
+            if min_val > 0:
+                range_pct = (max_val - min_val) / min_val
+            else:
+                range_pct = 0
+            
+            # Check if still within buffer
+            if range_pct <= buffer_pct:
+                best_end_idx = end_idx
+                end_idx += 1
+            else:
+                # Buffer exceeded, stop expanding
+                break
+        
+        # Check if we found a valid zone
+        duration = best_end_idx - start_idx + 1
+        
+        if duration >= min_duration:
+            # Calculate final statistics for the zone
+            values_in_zone = []
+            for i in range(start_idx, best_end_idx + 1):
+                val = weekly_data[i].get(series_field)
+                if val is not None:
+                    values_in_zone.append(float(val))
+                used[i] = True  # Mark as used
+            
+            if values_in_zone:
+                min_val = min(values_in_zone)
+                max_val = max(values_in_zone)
+                avg_val = sum(values_in_zone) / len(values_in_zone)
+                range_pct = (max_val - min_val) / min_val if min_val > 0 else 0
+                
+                start_date = weekly_data[start_idx].get("date")
+                end_date = weekly_data[best_end_idx].get("date")
+                
+                if start_date and end_date:
+                    start_ts = int(datetime.combine(start_date, datetime.min.time()).timestamp())
+                    end_ts = int(datetime.combine(end_date, datetime.min.time()).timestamp())
+                    
+                    duration_weeks = (end_date - start_date).days / 7.0
+                    
+                    zone = {
+                        'zone_id': len(zones) + 1,
+                        'start_idx': start_idx,
+                        'end_idx': best_end_idx,
+                        'start_time': start_ts,
+                        'end_time': end_ts,
+                        'min_value': min_val,
+                        'max_value': max_val,
+                        'avg_value': avg_val,
+                        'duration_weeks': duration_weeks,
+                        'range_pct': range_pct * 100  # Convert to percentage
+                    }
+                    
+                    zones.append(zone)
+                    
+                    print(f"[CONSOLIDATION ZONE DEBUG] Zone #{zone['zone_id']}: "
+                          f"weeks {start_idx}-{best_end_idx} ({duration_weeks:.1f} weeks), "
+                          f"range {range_pct*100:.1f}%, values {min_val:.6f}-{max_val:.6f}")
+    
+    # Merge overlapping or adjacent zones (within 2 weeks of each other)
+    zones = _merge_adjacent_zones(zones, max_gap_weeks=2)
+    
+    print(f"[CONSOLIDATION ZONE DEBUG] ====== SUMMARY ======")
+    print(f"[CONSOLIDATION ZONE DEBUG] Total zones found: {len(zones)}")
+    for z in zones:
+        print(f"[CONSOLIDATION ZONE DEBUG]   Zone {z['zone_id']}: "
+              f"{z['duration_weeks']:.1f} weeks, range {z['range_pct']:.1f}%")
+    print(f"[CONSOLIDATION ZONE DEBUG] ====================")
+    
+    return zones
+
+
+def _merge_adjacent_zones(zones, max_gap_weeks=2):
+    """
+    Merge zones that are adjacent or very close to each other.
+    
+    Two zones are merged if:
+    1. They are within max_gap_weeks of each other
+    2. Their combined range still stays within the buffer
+    """
+    
+    if len(zones) <= 1:
+        return zones
+    
+    # Sort zones by start time
+    sorted_zones = sorted(zones, key=lambda z: z['start_time'])
+    
+    merged = [sorted_zones[0]]
+    
+    for current_zone in sorted_zones[1:]:
+        last_merged = merged[-1]
+        
+        # Calculate gap in weeks
+        gap_seconds = current_zone['start_time'] - last_merged['end_time']
+        gap_weeks = gap_seconds / (7 * 24 * 60 * 60)
+        
+        # Check if zones are close enough
+        if gap_weeks <= max_gap_weeks:
+            # Check if merging them would still keep range within buffer
+            combined_min = min(last_merged['min_value'], current_zone['min_value'])
+            combined_max = max(last_merged['max_value'], current_zone['max_value'])
+            combined_range_pct = (combined_max - combined_min) / combined_min if combined_min > 0 else 0
+            
+            if combined_range_pct <= CONSOLIDATION_BUFFER_PCT:
+                # Merge the zones
+                last_merged['end_idx'] = current_zone['end_idx']
+                last_merged['end_time'] = current_zone['end_time']
+                last_merged['min_value'] = combined_min
+                last_merged['max_value'] = combined_max
+                last_merged['avg_value'] = (last_merged['avg_value'] + current_zone['avg_value']) / 2
+                last_merged['duration_weeks'] = (
+                    datetime.fromtimestamp(last_merged['end_time']).date() - 
+                    datetime.fromtimestamp(last_merged['start_time']).date()
+                ).days / 7.0
+                last_merged['range_pct'] = combined_range_pct * 100
+                
+                print(f"[CONSOLIDATION ZONE DEBUG] Merged zone {current_zone['zone_id']} into zone {last_merged['zone_id']}")
+                continue
+        
+        # No merge, add as new zone
+        merged.append(current_zone)
+    
+    # Renumber zone IDs
+    for i, zone in enumerate(merged, 1):
+        zone['zone_id'] = i
+    
+    return merged
+
+
+def _assign_nrbs_to_zones(triggers, consolidation_zones):
+    """
+    🆕 NEW FUNCTION: Assign each NRB to the consolidation zone it belongs to.
+    
+    Logic:
+    1. For each NRB trigger
+    2. Check which consolidation zone contains the NRB's consolidation period
+    3. Assign the NRB to that zone
+    4. Attach zone metadata to the NRB
+    
+    An NRB belongs to a zone if its consolidation period (range_start_time to range_end_time)
+    overlaps with the zone's time period.
+    
+    Parameters:
+    - triggers: List of NRB trigger dicts
+    - consolidation_zones: List of consolidation zone dicts
+    
+    Returns:
+    - triggers with zone metadata attached
+    """
+    
+    if not triggers or not consolidation_zones:
+        print("[NRB ZONE ASSIGNMENT] No triggers or zones to assign")
         return triggers
     
-    # Sort by breakout time
-    sorted_triggers = sorted(triggers, key=lambda t: t["time"])
+    print(f"[NRB ZONE ASSIGNMENT] Assigning {len(triggers)} NRBs to {len(consolidation_zones)} zones")
     
-    def are_contiguous(nrb1, nrb2):
-        """Check if two NRBs are part of same contiguous group"""
-        r1 = nrb1.get("range_high")
-        r2 = nrb2.get("range_high")
+    for trigger in triggers:
+        # Get the NRB's consolidation period
+        nrb_range_start = trigger.get("range_start_time")
+        nrb_range_end = trigger.get("range_end_time")
+        nrb_breakout_time = trigger.get("time")
         
-        if r1 is None or r2 is None:
-            return False
+        if not nrb_range_start or not nrb_range_end:
+            continue
         
-        # Allow 20% tolerance in resistance levels
-        buffer = 0.20 * abs(r1)
-        return abs(r2 - r1) <= buffer
-    
-    # Build contiguous groups
-    contiguous_groups = []
-    current_group = [sorted_triggers[0]]
-    
-    for i in range(1, len(sorted_triggers)):
-        if are_contiguous(sorted_triggers[i - 1], sorted_triggers[i]):
-            current_group.append(sorted_triggers[i])
+        # Find the zone that overlaps with this NRB's consolidation period
+        best_zone = None
+        best_overlap = 0
+        
+        for zone in consolidation_zones:
+            zone_start = zone['start_time']
+            zone_end = zone['end_time']
+            
+            # Check for overlap
+            overlap_start = max(nrb_range_start, zone_start)
+            overlap_end = min(nrb_range_end, zone_end)
+            
+            if overlap_start <= overlap_end:
+                # There is overlap
+                overlap_duration = overlap_end - overlap_start
+                
+                if overlap_duration > best_overlap:
+                    best_overlap = overlap_duration
+                    best_zone = zone
+        
+        # Assign to the best matching zone
+        if best_zone:
+            trigger['consolidation_zone_id'] = best_zone['zone_id']
+            trigger['zone_start_time'] = best_zone['start_time']
+            trigger['zone_end_time'] = best_zone['end_time']
+            trigger['zone_duration_weeks'] = best_zone['duration_weeks']
+            trigger['zone_min_value'] = best_zone['min_value']
+            trigger['zone_max_value'] = best_zone['max_value']
+            trigger['zone_avg_value'] = best_zone['avg_value']
+            trigger['zone_range_pct'] = best_zone['range_pct']
+            
+            nrb_id = trigger.get('nrb_id', '?')
+            print(f"[NRB ZONE ASSIGNMENT] NRB #{nrb_id} → Zone #{best_zone['zone_id']} "
+                  f"(overlap: {best_overlap / (7*24*60*60):.1f} weeks)")
         else:
-            # Save current group and start new one
-            contiguous_groups.append(current_group)
-            current_group = [sorted_triggers[i]]
+            print(f"[NRB ZONE ASSIGNMENT] NRB #{trigger.get('nrb_id', '?')} has no matching zone")
     
-    # Don't forget the last group
-    contiguous_groups.append(current_group)
+    # Group statistics
+    zone_nrb_counts = {}
+    for trigger in triggers:
+        zone_id = trigger.get('consolidation_zone_id')
+        if zone_id:
+            zone_nrb_counts[zone_id] = zone_nrb_counts.get(zone_id, 0) + 1
     
-    # Assign group metadata to each trigger
-    for group_id, group in enumerate(contiguous_groups, start=1):
-        start_ts = group[0].get("range_start_time")
-        end_ts = group[-1].get("range_end_time")
-        
-        if start_ts and end_ts:
-            start_date = datetime.fromtimestamp(start_ts).date()
-            end_date = datetime.fromtimestamp(end_ts).date()
-            duration_weeks = (end_date - start_date).days / 7.0  # Use float for precision
-        else:
-            duration_weeks = 0
-        
-        for t in group:
-            t["nrb_group_id"] = group_id
-            t["group_start_time"] = start_ts
-            t["group_end_time"] = end_ts
-            t["group_duration_weeks"] = duration_weeks
-    
-    print(f"[NRB DEBUG] Total NRB groups found: {len(contiguous_groups)}")
-    for i, g in enumerate(contiguous_groups, 1):
-        print(f"  Group {i}: {len(g)} NRBs, Duration: {g[0].get('group_duration_weeks')} weeks")
+    print(f"[NRB ZONE ASSIGNMENT] ====== ASSIGNMENT SUMMARY ======")
+    for zone_id, count in sorted(zone_nrb_counts.items()):
+        print(f"[NRB ZONE ASSIGNMENT]   Zone {zone_id}: {count} NRBs")
+    print(f"[NRB ZONE ASSIGNMENT] ==================================")
     
     return triggers
+
 
 def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, cooldown_weeks: int = DEFAULT_COOLDOWN_WEEKS):
     """
@@ -273,30 +510,14 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, coo
     - Find the lowest LOW in those N weeks (support)
     - Check if the CURRENT week i breaks above resistance (HIGH > resistance)
     - If yes, record the breakout ONLY if it's beyond the cooldown period from the last breakout
-    - Move to next week and repeat (continuous sliding window with cooldown enforcement)
-    
-    Example with N=52 weeks:
-    - Week 52 (index 52): Check if it breaks resistance from weeks 0-51
-    - Week 53 (index 53): Check if it breaks resistance from weeks 1-52
-    - And so on...
-    
-    Cooldown Logic:
-    - After detecting an NRB at week X, the next NRB can only be detected at week X + cooldown_weeks or later
-    - This prevents detecting multiple NRBs in quick succession
-    
-    For RSC:
-    - HIGH = Max(rsc_sensex_ratio) in the week
-    - LOW = Min(rsc_sensex_ratio) in the week
-    - Resistance = Highest RSC ratio in the N-week window
-    - Breakout = Current week's RSC ratio breaks above resistance
     
     Parameters:
-    - weekly_data: list of weekly OHLC rows (or RSC high/low for RSC-based NRB)
-    - nrb_lookback: N (number of weeks in the rolling window, e.g., 52)
-    - cooldown_weeks: Minimum number of weeks between NRB detections (default: 4)
+    - weekly_data: list of weekly OHLC rows
+    - nrb_lookback: N (number of weeks in the rolling window)
+    - cooldown_weeks: Minimum number of weeks between NRB detections
     
     Returns:
-    - List of breakout triggers with resistance/support levels (filtered by cooldown)
+    - List of breakout triggers (filtered by cooldown)
     """
     
     if len(weekly_data) < nrb_lookback + 1:
@@ -319,42 +540,32 @@ def _detect_narrow_range_break_rolling(weekly_data: list, nrb_lookback: int, coo
     nrb_id = 1
     last_breakout_idx = None
     
-    # DEBUG counters
     checks_performed = 0
     breakouts_found = 0
     cooldown_blocked = 0
 
-    # Start from week N (index nrb_lookback)
     for i in range(nrb_lookback, n):
         
         checks_performed += 1
         
-        # Define the N-week lookback window: [i-N, i-1]
         window_start = i - nrb_lookback
         window_end = i
         
-        # Get the N weeks in this window
         window_weeks = rows[window_start:window_end]
         
-        # Calculate resistance (highest HIGH) and support (lowest LOW) in this N-week window
         range_high = max(week["high"] for week in window_weeks)
         range_low = min(week["low"] for week in window_weeks)
         
-        # Check the CURRENT week (i) for breakout
         breakout_week = rows[i]
         
-        # DEBUG: Print first few checks
         if checks_performed <= 3 or (breakout_week["high"] > range_high):
             print(f"[NRB DEBUG] Week {i}: high={breakout_week['high']:.6f}, resistance={range_high:.6f}, breakout={breakout_week['high'] > range_high}")
         
-        # NRB condition: Current week's HIGH breaks above N-week resistance
         if breakout_week["high"] > range_high:
             
             breakouts_found += 1
             
-            # COOLDOWN CHECK
             if last_breakout_idx is None or (i - last_breakout_idx) >= cooldown_weeks:
-                # Breakout found and cooldown satisfied!
                 breakout_date = breakout_week["date"]
                 score = breakout_week["is_successful_trade"]
                 
@@ -395,8 +606,6 @@ def _attach_daily_breakout_times_price(base_queryset, triggers):
     """
     Refine each NRB trigger from WEEKLY breakout time to the EXACT DAILY candle
     where the DAILY CLOSE first crosses ABOVE the resistance.
-    
-    This works for price-based (OHLC) NRB detection.
     """
     if not triggers:
         return triggers
@@ -444,9 +653,6 @@ def _attach_daily_breakout_times_parameter(param_qs, value_field: str, triggers)
     """
     Refine each NRB trigger from WEEKLY breakout time to the EXACT DAILY candle
     where the DAILY SERIES value first crosses ABOVE the resistance.
-    
-    This works for parameter-based (EMA/RSC) NRB detection.
-    For RSC: value_field will be 'rsc_sensex_ratio' (the gray line).
     """
     if not triggers:
         return triggers
@@ -495,7 +701,6 @@ def _attach_daily_breakout_times_parameter(param_qs, value_field: str, triggers)
 def _detect_bowl_pattern(queryset):
     """
     Bowl detection based on EMA 50 stored in Parameter table.
-    (Bowl logic remains unchanged)
     """
     raw_rows = list(
         queryset

@@ -13,85 +13,14 @@ from core.pattern_recognition import (
     BOWL_MIN_DURATION_DAYS,
     NRB_LOOKBACK,
     DEFAULT_COOLDOWN_WEEKS,
+    CONSOLIDATION_BUFFER_PCT,
+    MIN_CONSOLIDATION_DURATION_WEEKS,
+    _find_consolidation_zones,
 )
 
 from .serializers import SymbolListItemSerializer
 from .pagination import SymbolPagination
 from .utils import relevance
-
-
-def _calculate_total_nrb_duration(triggers):
-    """
-    Build ALL DISTINCT contiguous NRB groups (non-overlapping).
-    
-    For EACH group:
-      - start_date
-      - end_date
-      - duration in weeks
-    
-    Attach per-trigger:
-      - nrb_group_id
-      - group_start_time
-      - group_end_time
-      - group_duration_weeks
-    """
-    
-    if not triggers:
-        return triggers
-    
-    # Sort by breakout time
-    sorted_triggers = sorted(triggers, key=lambda t: t["time"])
-    
-    def are_contiguous(nrb1, nrb2):
-        """Check if two NRBs are part of same contiguous group"""
-        r1 = nrb1.get("range_high")
-        r2 = nrb2.get("range_high")
-        
-        if r1 is None or r2 is None:
-            return False
-        
-        # Allow 20% tolerance in resistance levels
-        buffer = 0.20 * abs(r1)
-        return abs(r2 - r1) <= buffer
-    
-    # Build contiguous groups
-    contiguous_groups = []
-    current_group = [sorted_triggers[0]]
-    
-    for i in range(1, len(sorted_triggers)):
-        if are_contiguous(sorted_triggers[i - 1], sorted_triggers[i]):
-            current_group.append(sorted_triggers[i])
-        else:
-            # Save current group and start new one
-            contiguous_groups.append(current_group)
-            current_group = [sorted_triggers[i]]
-    
-    # Don't forget the last group
-    contiguous_groups.append(current_group)
-    
-    # Assign group metadata to each trigger
-    for group_id, group in enumerate(contiguous_groups, start=1):
-        start_ts = group[0].get("range_start_time")
-        end_ts = group[-1].get("range_end_time")
-        
-        if start_ts and end_ts:
-            start_date = datetime.fromtimestamp(start_ts).date()
-            end_date = datetime.fromtimestamp(end_ts).date()
-            duration_weeks = (end_date - start_date).days / 7.0  # Use float for precision
-        else:
-            duration_weeks = 0
-        
-        for t in group:
-            t["nrb_group_id"] = group_id
-            t["group_start_time"] = start_ts
-            t["group_end_time"] = end_ts
-            t["group_duration_weeks"] = duration_weeks
-    
-    print(f"[NRB DEBUG] Total NRB groups found: {len(contiguous_groups)}")
-    for i, g in enumerate(contiguous_groups, 1):
-        print(f"  Group {i}: {len(g)} NRBs, Duration: {g[0].get('group_duration_weeks'):.2f} weeks")
-    
-    return triggers
 
 
 class SymbolListView(APIView):
@@ -202,7 +131,6 @@ class PatternScanView(APIView):
             series_param = request.query_params.get("series")
             series = series_param.strip().lower() if series_param else None
 
-            # Get cooldown_weeks from frontend, default to DEFAULT_COOLDOWN_WEEKS
             cooldown_weeks_param = request.query_params.get("cooldown_weeks")
             cooldown_weeks = int(cooldown_weeks_param) if cooldown_weeks_param else DEFAULT_COOLDOWN_WEEKS
 
@@ -224,7 +152,7 @@ class PatternScanView(APIView):
             symbol__symbol=scrip, ema50__isnull=False
         ).count()
 
-        # Get pattern triggers
+        # Get pattern triggers with consolidation zones
         trigger_markers = get_pattern_triggers(
             scrip=scrip,
             pattern=pattern,
@@ -234,10 +162,6 @@ class PatternScanView(APIView):
             series=series,
             cooldown_weeks=cooldown_weeks,
         )
-
-        # ✅ FIX: Ensure NRB grouping is calculated for NRB-related patterns
-        if trigger_markers and pattern in ["NRB", "NR4", "NR7"]:
-            trigger_markers = _calculate_total_nrb_duration(trigger_markers)
 
         ohlcv_qs = EodPrice.objects.filter(symbol__symbol=scrip).order_by("trade_date")
         ohlcv_data = [
@@ -266,6 +190,8 @@ class PatternScanView(APIView):
             "rsc500": "rsc500",
         }
 
+        # Get weekly data for consolidation zone calculation
+        weekly_data = []
         if series in valid_series_fields:
             field_name = valid_series_fields[series]
             
@@ -317,6 +243,24 @@ class PatternScanView(APIView):
                     for row in param_qs
                     if row.rsc_sensex_ema10 is not None
                 ]
+
+                # Get weekly data for zone calculation
+                from django.db.models.functions import TruncWeek
+                from django.db.models import Min, Max
+                weekly_qs = (
+                    param_qs
+                    .annotate(week=TruncWeek("trade_date"))
+                    .values("week")
+                    .annotate(
+                        high=Max(field_name),
+                        low=Min(field_name),
+                        close=Max(field_name),
+                        date=Max("trade_date"),
+                    )
+                    .order_by("week")
+                )
+                weekly_data = list(weekly_qs.values("date", "high", "low", "close", "week"))
+
             else:
                 param_qs = (
                     Parameter.objects.filter(symbol__symbol=scrip)
@@ -336,47 +280,69 @@ class PatternScanView(APIView):
                     for row in param_qs
                 ]
 
-        # ✅ FIX: Build RSC lookup BEFORE processing markers
+                # Get weekly data for zone calculation
+                from django.db.models.functions import TruncWeek
+                from django.db.models import Min, Max
+                weekly_qs = (
+                    param_qs
+                    .annotate(week=TruncWeek("trade_date"))
+                    .values("week")
+                    .annotate(
+                        high=Max(field_name),
+                        low=Min(field_name),
+                        close=Max(field_name),
+                        date=Max("trade_date"),
+                    )
+                    .order_by("week")
+                )
+                weekly_data = list(weekly_qs.values("date", "high", "low", "close", "week"))
+
+        # Get consolidation zones separately for the response
+        consolidation_zones = []
+        if weekly_data and pattern == "Narrow Range Break":
+            from core.pattern_recognition import CONSOLIDATION_BUFFER_PCT, MIN_CONSOLIDATION_DURATION_WEEKS
+            consolidation_zones = _find_consolidation_zones(
+                weekly_data,
+                series_field='close',
+                buffer_pct=CONSOLIDATION_BUFFER_PCT,
+                min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
+            )
+
+        # Build RSC lookup for marker conversion
         rsc_lookup = {}
         if series == "rsc30" and series_data:
             for point in series_data:
                 rsc_lookup[point["time"]] = point["value"]
 
-        # ✅ FIX: Extract unique NRB groups using proper grouping
-        nrb_groups = []
+        # Extract unique consolidation zones from markers
+        zones_by_id = {}
         if trigger_markers:
-            groups_dict = defaultdict(list)
-            
             for marker in trigger_markers:
-                group_id = marker.get("nrb_group_id")
-                if group_id:
-                    groups_dict[group_id].append(marker)
-            
-            # Build nrb_groups array with proper metadata
-            for group_id in sorted(groups_dict.keys()):
-                group = groups_dict[group_id]
-                first_marker = group[0]
+                zone_id = marker.get("consolidation_zone_id")
+                if zone_id and zone_id not in zones_by_id:
+                    zones_by_id[zone_id] = {
+                        "zone_id": zone_id,
+                        "start_time": marker.get("zone_start_time"),
+                        "end_time": marker.get("zone_end_time"),
+                        "duration_weeks": marker.get("zone_duration_weeks", 0),
+                        "min_value": marker.get("zone_min_value"),
+                        "max_value": marker.get("zone_max_value"),
+                        "avg_value": marker.get("zone_avg_value"),
+                        "range_pct": marker.get("zone_range_pct", 0),
+                        "num_nrbs": 0,
+                    }
                 
-                # Calculate average range_high for the group
-                valid_range_highs = [m.get("range_high") for m in group if m.get("range_high") is not None]
-                avg_range_high = sum(valid_range_highs) / len(valid_range_highs) if valid_range_highs else None
-                
-                nrb_groups.append({
-                    "group_id": group_id,
-                    "duration_weeks": first_marker.get("group_duration_weeks", 0),
-                    "start_time": first_marker.get("group_start_time"),
-                    "end_time": first_marker.get("group_end_time"),
-                    "num_nrbs": len(group),
-                    "avg_range_high": avg_range_high,
-                })
+                if zone_id:
+                    zones_by_id[zone_id]["num_nrbs"] += 1
+
+        consolidation_groups = list(zones_by_id.values())
 
         # Debug log
-        print(f"[VIEW DEBUG] Extracted {len(nrb_groups)} NRB groups")
-        for g in nrb_groups:
-            duration = g.get('duration_weeks', 0)
-            print(f"  Group {g['group_id']}: {g['num_nrbs']} NRBs, {duration:.2f} weeks")
+        print(f"[VIEW DEBUG] Extracted {len(consolidation_groups)} consolidation zones")
+        for g in consolidation_groups:
+            print(f"  Zone {g['zone_id']}: {g['num_nrbs']} NRBs, {g['duration_weeks']:.2f} weeks, Range: {g['range_pct']:.1f}%")
 
-        # ✅ FIX: Process markers with RSC conversion done once per marker
+        # Process markers
         markers = []
         for row in trigger_markers:
             score = row.get("score", 0.0)
@@ -391,20 +357,18 @@ class PatternScanView(APIView):
             range_low = row.get("range_low")
             range_high = row.get("range_high")
             
-            # ✅ FIX: Convert to RSC scale if needed (make copies to avoid mutation)
+            # Convert to RSC scale if needed
             if series == "rsc30" and range_low is not None and range_high is not None:
                 range_start_time = row.get("range_start_time")
                 range_end_time = row.get("range_end_time")
                 
                 if range_start_time and range_end_time:
-                    # Get RSC values during the range period
                     rsc_values_in_range = [
                         v for t, v in rsc_lookup.items() 
                         if range_start_time <= t <= range_end_time
                     ]
                     
                     if rsc_values_in_range:
-                        # Use min/max RSC in range
                         range_low = min(rsc_values_in_range)
                         range_high = max(rsc_values_in_range)
 
@@ -420,16 +384,16 @@ class PatternScanView(APIView):
                 "range_start_time": row.get("range_start_time"),
                 "range_end_time": row.get("range_end_time"),
                 "nrb_id": row.get("nrb_id"),
-                "nrb_group_id": row.get("nrb_group_id"),  # Include group ID in marker
+                "consolidation_zone_id": row.get("consolidation_zone_id"),
                 "nr_high": row.get("nr_high"),
                 "nr_low": row.get("nr_low"),
                 "direction": row.get("direction"),
             })
 
-        # ✅ FIX: Calculate total duration properly with safe access
-        total_nrb_duration_weeks = sum(
-            g.get("duration_weeks", 0) for g in nrb_groups
-        ) if nrb_groups else 0
+        # Calculate total duration
+        total_consolidation_duration_weeks = sum(
+            z.get("duration_weeks", 0) for z in consolidation_groups
+        ) if consolidation_groups else 0
 
         response_data = {
             "scrip": scrip,
@@ -440,8 +404,8 @@ class PatternScanView(APIView):
             "series_data": series_data,
             "series_data_ema5": series_data_ema5,
             "series_data_ema10": series_data_ema10,
-            "total_nrb_duration_weeks": round(total_nrb_duration_weeks, 2),
-            "nrb_groups": nrb_groups,
+            "total_consolidation_duration_weeks": round(total_consolidation_duration_weeks, 2),
+            "consolidation_zones": consolidation_groups,  # Changed from nrb_groups
             "debug": {
                 "total_rows": total_rows,
                 "ema_rows": ema_rows,
@@ -456,14 +420,13 @@ class PatternScanView(APIView):
                 "series_data_points": len(series_data),
                 "series_data_ema5_points": len(series_data_ema5),
                 "series_data_ema10_points": len(series_data_ema10),
-                "nrb_groups_count": len(nrb_groups),
+                "consolidation_zones_count": len(consolidation_groups),
             },
         }
         
-        # Debug: Print what we're about to send
         print(f"[VIEW DEBUG] Response data keys: {response_data.keys()}")
-        print(f"[VIEW DEBUG] Response total_nrb_duration_weeks: {response_data.get('total_nrb_duration_weeks')}")
-        print(f"[VIEW DEBUG] Response nrb_groups count: {len(nrb_groups)}")
+        print(f"[VIEW DEBUG] Response total_consolidation_duration_weeks: {response_data.get('total_consolidation_duration_weeks')}")
+        print(f"[VIEW DEBUG] Response consolidation_zones count: {len(consolidation_groups)}")
 
         return Response(response_data, status=status.HTTP_200_OK)
 
@@ -565,7 +528,6 @@ class PriceHistoryView(APIView):
             "records": len(price_data),
         }
 
-        # Store in cache
         cache.set(cache_key, response, timeout=self.CACHE_TIMEOUT)
 
         return Response(response, status=status.HTTP_200_OK)
@@ -578,9 +540,6 @@ class Week52HighView(APIView):
     """
 
     def get(self, request, *args, **kwargs):
-        # -----------------------------------------
-        # 1. Validate Input
-        # -----------------------------------------
         scrip = request.query_params.get("scrip")
         if not scrip:
             return Response(
@@ -588,14 +547,8 @@ class Week52HighView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # -----------------------------------------
-        # 2. Compute cutoff date (52 weeks)
-        # -----------------------------------------
         cutoff_date = date.today() - timedelta(days=365)
 
-        # -----------------------------------------
-        # 3. Check if scrip is a STOCK
-        # -----------------------------------------
         stock_exists = Symbol.objects.filter(symbol=scrip).exists()
 
         if stock_exists:
@@ -607,9 +560,6 @@ class Week52HighView(APIView):
                 .aggregate(week52_high=Max("high"))
             )
         else:
-            # -----------------------------------------
-            # 4. Check if scrip is an INDEX
-            # -----------------------------------------
             index_exists = Index.objects.filter(symbol=scrip).exists()
 
             if not index_exists:
@@ -628,9 +578,6 @@ class Week52HighView(APIView):
                 .aggregate(week52_high=Max("high"))
             )
 
-        # -----------------------------------------
-        # 5. Extract result
-        # -----------------------------------------
         week52_high = data.get("week52_high")
 
         if week52_high is None:
@@ -643,9 +590,6 @@ class Week52HighView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        # -----------------------------------------
-        # 6. Return Response
-        # -----------------------------------------
         return Response(
             {
                 "scrip": scrip,
