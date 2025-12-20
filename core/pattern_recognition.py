@@ -25,8 +25,8 @@ NRB_LOOKBACK = 7
 # Default cooldown period in weeks
 DEFAULT_COOLDOWN_WEEKS = 4
 
-# Buffer percentage for consolidation zone detection (30%)
-CONSOLIDATION_BUFFER_PCT = 0.30
+# Buffer percentage for consolidation zone detection (35%)
+CONSOLIDATION_BUFFER_PCT = 0.35
 
 # Minimum duration for a valid consolidation zone (in weeks)
 MIN_CONSOLIDATION_DURATION_WEEKS = 4
@@ -62,6 +62,9 @@ def get_pattern_triggers(
       
     Parameters:
       - cooldown_weeks: Minimum number of weeks between NRB detections (default: 4)
+    
+    🆕 UPDATED: Consolidation zones are now detected AFTER NRB detection,
+    and only zones that end with an NRB are kept.
     """
     series_normalized = (series or "").strip().lower()
 
@@ -87,17 +90,18 @@ def get_pattern_triggers(
             if not weekly_data:
                 return []
 
-            # Step 1: Find ALL consolidation zones in the data
-            consolidation_zones = _find_consolidation_zones(
+            # Step 1: Detect NRB breakouts FIRST
+            triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
+            triggers = _attach_daily_breakout_times_price(base_queryset, triggers)
+            
+            # Step 2: Find consolidation zones that END with these NRBs
+            consolidation_zones = _find_consolidation_zones_with_nrb(
                 weekly_data, 
+                triggers,
                 series_field='close',
                 buffer_pct=CONSOLIDATION_BUFFER_PCT,
                 min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
             )
-
-            # Step 2: Detect NRB breakouts
-            triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
-            triggers = _attach_daily_breakout_times_price(base_queryset, triggers)
             
             # Step 3: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
@@ -162,20 +166,21 @@ def get_pattern_triggers(
             print(f"[NRB DEBUG] First 3 weeks: {weekly_data[:3]}")
             print(f"[NRB DEBUG] Last 3 weeks: {weekly_data[-3:]}")
 
-            # Step 1: Find ALL consolidation zones in the data
-            consolidation_zones = _find_consolidation_zones(
-                weekly_data, 
-                series_field='close',
-                buffer_pct=CONSOLIDATION_BUFFER_PCT,
-                min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
-            )
-
-            # Step 2: Detect NRB breakouts
+            # Step 1: Detect NRB breakouts FIRST
             triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             print(f"[NRB DEBUG] Triggers found: {len(triggers)}")
             
             triggers = _attach_daily_breakout_times_parameter(
                 param_qs, series_field, triggers
+            )
+            
+            # Step 2: Find consolidation zones that END with these NRBs
+            consolidation_zones = _find_consolidation_zones_with_nrb(
+                weekly_data,
+                triggers, 
+                series_field='close',
+                buffer_pct=CONSOLIDATION_BUFFER_PCT,
+                min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
             )
             
             # Step 3: Assign each NRB to its consolidation zone
@@ -213,121 +218,117 @@ def get_weekly_queryset(base_queryset):
     )
 
 
-def _find_consolidation_zones(weekly_data, series_field='close', buffer_pct=0.30, min_duration=4):
+def _find_consolidation_zones_with_nrb(weekly_data, nrb_triggers, series_field='close', buffer_pct=0.35, min_duration=4):
     """
-    🆕 NEW FUNCTION: Scan the ENTIRE time series to find ALL consolidation zones
-    where the parameter stays within a specified buffer percentage.
+    🆕 UPDATED: Find consolidation zones that END with an NRB breakout.
+    Buffer is calculated based on the FIRST value of each zone.
     
     Algorithm:
-    1. Use a sliding/expanding window approach
-    2. For each starting point, expand the window while values stay within buffer
-    3. When buffer is exceeded, save the zone if it's long enough
-    4. Merge overlapping zones
-    5. Return list of all valid consolidation zones
+    1. Start from each potential zone beginning
+    2. Use the FIRST value as the base for buffer calculation
+    3. Expand window while values stay within buffer_pct of the first value
+    4. A zone is ONLY valid if it ends with an NRB breakout
+    5. If no NRB at the end, discard the zone and start fresh from next point
     
     Parameters:
     - weekly_data: List of weekly OHLC/parameter data
+    - nrb_triggers: List of NRB breakout triggers (with range_end_time)
     - series_field: 'close' for aggregated weekly value
-    - buffer_pct: Maximum percentage range allowed (default: 30%)
+    - buffer_pct: Maximum percentage range allowed from FIRST value (default: 35%)
     - min_duration: Minimum weeks for a valid zone (default: 4)
     
     Returns:
-    - List of consolidation zone dicts:
-      {
-          'zone_id': int,
-          'start_idx': int,
-          'end_idx': int,
-          'start_time': timestamp,
-          'end_time': timestamp,
-          'min_value': float,
-          'max_value': float,
-          'avg_value': float,
-          'duration_weeks': float,
-          'range_pct': float
-      }
+    - List of valid consolidation zones (only those ending with NRB)
     """
     
-    if not weekly_data:
+    if not weekly_data or not nrb_triggers:
+        print("[CONSOLIDATION ZONE DEBUG] No data or no NRB triggers")
         return []
     
     print(f"[CONSOLIDATION ZONE DEBUG] Starting zone detection on {len(weekly_data)} weeks")
     print(f"[CONSOLIDATION ZONE DEBUG] Buffer: {buffer_pct*100}%, Min duration: {min_duration} weeks")
+    print(f"[CONSOLIDATION ZONE DEBUG] NRB triggers available: {len(nrb_triggers)}")
+    
+    # Create a set of NRB end times for quick lookup
+    nrb_end_times = set()
+    for trigger in nrb_triggers:
+        end_time = trigger.get('range_end_time')
+        if end_time:
+            nrb_end_times.add(end_time)
+    
+    print(f"[CONSOLIDATION ZONE DEBUG] NRB end times: {len(nrb_end_times)}")
     
     zones = []
     n = len(weekly_data)
-    used = [False] * n  # Track which weeks are already in a zone
+    i = 0  # Current starting position
     
-    # Scan through all possible starting points
-    for start_idx in range(n):
+    while i < n:
         
-        if used[start_idx]:
-            continue  # Skip if already part of a zone
+        # Get the first value for this potential zone
+        first_value = weekly_data[i].get(series_field)
+        if first_value is None:
+            i += 1
+            continue
         
-        # Try to expand window from this starting point
-        end_idx = start_idx
-        best_end_idx = start_idx
+        first_value = float(first_value)
         
-        while end_idx < n:
-            # Extract values in current window
-            values_in_window = []
-            for i in range(start_idx, end_idx + 1):
-                val = weekly_data[i].get(series_field)
-                if val is not None:
-                    values_in_window.append(float(val))
+        # Calculate buffer bounds based on FIRST value
+        lower_bound = first_value * (1 - buffer_pct)
+        upper_bound = first_value * (1 + buffer_pct)
+        
+        print(f"[CONSOLIDATION ZONE DEBUG] Starting zone at week {i}, first_value={first_value:.6f}, bounds=[{lower_bound:.6f}, {upper_bound:.6f}]")
+        
+        # Expand the zone while values stay within buffer
+        j = i
+        values_in_zone = [first_value]
+        
+        while j < n - 1:
+            j += 1
+            next_value = weekly_data[j].get(series_field)
             
-            if not values_in_window:
+            if next_value is None:
                 break
             
-            # Calculate range statistics
-            min_val = min(values_in_window)
-            max_val = max(values_in_window)
+            next_value = float(next_value)
             
-            if min_val > 0:
-                range_pct = (max_val - min_val) / min_val
-            else:
-                range_pct = 0
-            
-            # Check if still within buffer
-            if range_pct <= buffer_pct:
-                best_end_idx = end_idx
-                end_idx += 1
+            # Check if next value is within buffer of FIRST value
+            if lower_bound <= next_value <= upper_bound:
+                values_in_zone.append(next_value)
             else:
                 # Buffer exceeded, stop expanding
+                j -= 1  # Step back to last valid point
                 break
         
-        # Check if we found a valid zone
-        duration = best_end_idx - start_idx + 1
+        # Now check if this zone ends with an NRB
+        duration = j - i + 1
         
         if duration >= min_duration:
-            # Calculate final statistics for the zone
-            values_in_zone = []
-            for i in range(start_idx, best_end_idx + 1):
-                val = weekly_data[i].get(series_field)
-                if val is not None:
-                    values_in_zone.append(float(val))
-                used[i] = True  # Mark as used
+            # Get the end time of this potential zone
+            zone_end_date = weekly_data[j].get("date")
             
-            if values_in_zone:
-                min_val = min(values_in_zone)
-                max_val = max(values_in_zone)
-                avg_val = sum(values_in_zone) / len(values_in_zone)
-                range_pct = (max_val - min_val) / min_val if min_val > 0 else 0
+            if zone_end_date:
+                zone_end_ts = int(datetime.combine(zone_end_date, datetime.min.time()).timestamp())
                 
-                start_date = weekly_data[start_idx].get("date")
-                end_date = weekly_data[best_end_idx].get("date")
-                
-                if start_date and end_date:
+                # Check if this zone ends with an NRB
+                if zone_end_ts in nrb_end_times:
+                    # Valid zone! Save it
+                    start_date = weekly_data[i].get("date")
                     start_ts = int(datetime.combine(start_date, datetime.min.time()).timestamp())
-                    end_ts = int(datetime.combine(end_date, datetime.min.time()).timestamp())
                     
-                    duration_weeks = (end_date - start_date).days / 7.0
+                    min_val = min(values_in_zone)
+                    max_val = max(values_in_zone)
+                    avg_val = sum(values_in_zone) / len(values_in_zone)
+                    range_pct = (max_val - min_val) / first_value if first_value > 0 else 0
+                    
+                    duration_weeks = (zone_end_date - start_date).days / 7.0
                     
                     zone = {
                         'zone_id': len(zones) + 1,
-                        'start_idx': start_idx,
-                        'end_idx': best_end_idx,
+                        'start_idx': i,
+                        'end_idx': j,
                         'start_time': start_ts,
-                        'end_time': end_ts,
+                        'end_time': zone_end_ts,
+                        'first_value': first_value,
                         'min_value': min_val,
                         'max_value': max_val,
                         'avg_value': avg_val,
@@ -337,83 +338,38 @@ def _find_consolidation_zones(weekly_data, series_field='close', buffer_pct=0.30
                     
                     zones.append(zone)
                     
-                    print(f"[CONSOLIDATION ZONE DEBUG] Zone #{zone['zone_id']}: "
-                          f"weeks {start_idx}-{best_end_idx} ({duration_weeks:.1f} weeks), "
-                          f"range {range_pct*100:.1f}%, values {min_val:.6f}-{max_val:.6f}")
-    
-    # Merge overlapping or adjacent zones (within 2 weeks of each other)
-    zones = _merge_adjacent_zones(zones, max_gap_weeks=2)
+                    print(f"[CONSOLIDATION ZONE DEBUG] ✓ Valid Zone #{zone['zone_id']}: "
+                          f"weeks {i}-{j} ({duration_weeks:.1f} weeks), "
+                          f"first_value={first_value:.6f}, range {range_pct*100:.1f}%, "
+                          f"ends with NRB")
+                    
+                    # Move to next position AFTER this zone
+                    i = j + 1
+                else:
+                    print(f"[CONSOLIDATION ZONE DEBUG] ✗ Zone at weeks {i}-{j} does NOT end with NRB, discarding")
+                    # Zone doesn't end with NRB, start fresh from next point
+                    i += 1
+            else:
+                i += 1
+        else:
+            # Zone too short, move forward
+            print(f"[CONSOLIDATION ZONE DEBUG] ✗ Zone at weeks {i}-{j} too short ({duration} < {min_duration})")
+            i += 1
     
     print(f"[CONSOLIDATION ZONE DEBUG] ====== SUMMARY ======")
-    print(f"[CONSOLIDATION ZONE DEBUG] Total zones found: {len(zones)}")
+    print(f"[CONSOLIDATION ZONE DEBUG] Total valid zones found: {len(zones)}")
     for z in zones:
         print(f"[CONSOLIDATION ZONE DEBUG]   Zone {z['zone_id']}: "
-              f"{z['duration_weeks']:.1f} weeks, range {z['range_pct']:.1f}%")
+              f"{z['duration_weeks']:.1f} weeks, first={z['first_value']:.6f}, "
+              f"range {z['range_pct']:.1f}%")
     print(f"[CONSOLIDATION ZONE DEBUG] ====================")
     
     return zones
 
 
-def _merge_adjacent_zones(zones, max_gap_weeks=2):
-    """
-    Merge zones that are adjacent or very close to each other.
-    
-    Two zones are merged if:
-    1. They are within max_gap_weeks of each other
-    2. Their combined range still stays within the buffer
-    """
-    
-    if len(zones) <= 1:
-        return zones
-    
-    # Sort zones by start time
-    sorted_zones = sorted(zones, key=lambda z: z['start_time'])
-    
-    merged = [sorted_zones[0]]
-    
-    for current_zone in sorted_zones[1:]:
-        last_merged = merged[-1]
-        
-        # Calculate gap in weeks
-        gap_seconds = current_zone['start_time'] - last_merged['end_time']
-        gap_weeks = gap_seconds / (7 * 24 * 60 * 60)
-        
-        # Check if zones are close enough
-        if gap_weeks <= max_gap_weeks:
-            # Check if merging them would still keep range within buffer
-            combined_min = min(last_merged['min_value'], current_zone['min_value'])
-            combined_max = max(last_merged['max_value'], current_zone['max_value'])
-            combined_range_pct = (combined_max - combined_min) / combined_min if combined_min > 0 else 0
-            
-            if combined_range_pct <= CONSOLIDATION_BUFFER_PCT:
-                # Merge the zones
-                last_merged['end_idx'] = current_zone['end_idx']
-                last_merged['end_time'] = current_zone['end_time']
-                last_merged['min_value'] = combined_min
-                last_merged['max_value'] = combined_max
-                last_merged['avg_value'] = (last_merged['avg_value'] + current_zone['avg_value']) / 2
-                last_merged['duration_weeks'] = (
-                    datetime.fromtimestamp(last_merged['end_time']).date() - 
-                    datetime.fromtimestamp(last_merged['start_time']).date()
-                ).days / 7.0
-                last_merged['range_pct'] = combined_range_pct * 100
-                
-                print(f"[CONSOLIDATION ZONE DEBUG] Merged zone {current_zone['zone_id']} into zone {last_merged['zone_id']}")
-                continue
-        
-        # No merge, add as new zone
-        merged.append(current_zone)
-    
-    # Renumber zone IDs
-    for i, zone in enumerate(merged, 1):
-        zone['zone_id'] = i
-    
-    return merged
-
-
 def _assign_nrbs_to_zones(triggers, consolidation_zones):
     """
-    🆕 NEW FUNCTION: Assign each NRB to the consolidation zone it belongs to.
+    🆕 UPDATED: Assign each NRB to the consolidation zone it belongs to.
     
     Logic:
     1. For each NRB trigger
@@ -477,6 +433,7 @@ def _assign_nrbs_to_zones(triggers, consolidation_zones):
             trigger['zone_max_value'] = best_zone['max_value']
             trigger['zone_avg_value'] = best_zone['avg_value']
             trigger['zone_range_pct'] = best_zone['range_pct']
+            trigger['zone_first_value'] = best_zone['first_value']
             
             nrb_id = trigger.get('nrb_id', '?')
             print(f"[NRB ZONE ASSIGNMENT] NRB #{nrb_id} → Zone #{best_zone['zone_id']} "

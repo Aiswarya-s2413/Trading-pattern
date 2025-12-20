@@ -15,7 +15,7 @@ from core.pattern_recognition import (
     DEFAULT_COOLDOWN_WEEKS,
     CONSOLIDATION_BUFFER_PCT,
     MIN_CONSOLIDATION_DURATION_WEEKS,
-    _find_consolidation_zones,
+    # REMOVED: _find_consolidation_zones - no longer needed
 )
 
 from .serializers import SymbolListItemSerializer
@@ -152,7 +152,7 @@ class PatternScanView(APIView):
             symbol__symbol=scrip, ema50__isnull=False
         ).count()
 
-        # Get pattern triggers with consolidation zones
+        # 🆕 Get pattern triggers - consolidation zones are now embedded in the triggers
         trigger_markers = get_pattern_triggers(
             scrip=scrip,
             pattern=pattern,
@@ -190,8 +190,9 @@ class PatternScanView(APIView):
             "rsc500": "rsc500",
         }
 
-        # Get weekly data for consolidation zone calculation
-        weekly_data = []
+        # 🆕 REMOVED: Weekly data calculation - no longer needed here
+        # Consolidation zones are now calculated inside get_pattern_triggers()
+        
         if series in valid_series_fields:
             field_name = valid_series_fields[series]
             
@@ -244,23 +245,6 @@ class PatternScanView(APIView):
                     if row.rsc_sensex_ema10 is not None
                 ]
 
-                # Get weekly data for zone calculation
-                from django.db.models.functions import TruncWeek
-                from django.db.models import Min, Max
-                weekly_qs = (
-                    param_qs
-                    .annotate(week=TruncWeek("trade_date"))
-                    .values("week")
-                    .annotate(
-                        high=Max(field_name),
-                        low=Min(field_name),
-                        close=Max(field_name),
-                        date=Max("trade_date"),
-                    )
-                    .order_by("week")
-                )
-                weekly_data = list(weekly_qs.values("date", "high", "low", "close", "week"))
-
             else:
                 param_qs = (
                     Parameter.objects.filter(symbol__symbol=scrip)
@@ -280,33 +264,8 @@ class PatternScanView(APIView):
                     for row in param_qs
                 ]
 
-                # Get weekly data for zone calculation
-                from django.db.models.functions import TruncWeek
-                from django.db.models import Min, Max
-                weekly_qs = (
-                    param_qs
-                    .annotate(week=TruncWeek("trade_date"))
-                    .values("week")
-                    .annotate(
-                        high=Max(field_name),
-                        low=Min(field_name),
-                        close=Max(field_name),
-                        date=Max("trade_date"),
-                    )
-                    .order_by("week")
-                )
-                weekly_data = list(weekly_qs.values("date", "high", "low", "close", "week"))
-
-        # Get consolidation zones separately for the response
-        consolidation_zones = []
-        if weekly_data and pattern == "Narrow Range Break":
-            from core.pattern_recognition import CONSOLIDATION_BUFFER_PCT, MIN_CONSOLIDATION_DURATION_WEEKS
-            consolidation_zones = _find_consolidation_zones(
-                weekly_data,
-                series_field='close',
-                buffer_pct=CONSOLIDATION_BUFFER_PCT,
-                min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
-            )
+        # 🆕 REMOVED: Separate consolidation zone calculation
+        # Zones are now embedded in trigger_markers from get_pattern_triggers()
 
         # Build RSC lookup for marker conversion
         rsc_lookup = {}
@@ -314,7 +273,8 @@ class PatternScanView(APIView):
             for point in series_data:
                 rsc_lookup[point["time"]] = point["value"]
 
-        # Extract unique consolidation zones from markers
+        # 🆕 Extract unique consolidation zones from the trigger markers
+        # Each trigger now includes its zone metadata
         zones_by_id = {}
         if trigger_markers:
             for marker in trigger_markers:
@@ -325,6 +285,7 @@ class PatternScanView(APIView):
                         "start_time": marker.get("zone_start_time"),
                         "end_time": marker.get("zone_end_time"),
                         "duration_weeks": marker.get("zone_duration_weeks", 0),
+                        "first_value": marker.get("zone_first_value"),  # 🆕 Added first value
                         "min_value": marker.get("zone_min_value"),
                         "max_value": marker.get("zone_max_value"),
                         "avg_value": marker.get("zone_avg_value"),
@@ -340,7 +301,10 @@ class PatternScanView(APIView):
         # Debug log
         print(f"[VIEW DEBUG] Extracted {len(consolidation_groups)} consolidation zones")
         for g in consolidation_groups:
-            print(f"  Zone {g['zone_id']}: {g['num_nrbs']} NRBs, {g['duration_weeks']:.2f} weeks, Range: {g['range_pct']:.1f}%")
+            print(f"  Zone {g['zone_id']}: {g['num_nrbs']} NRBs, "
+                  f"{g['duration_weeks']:.2f} weeks, "
+                  f"First value: {g.get('first_value', 'N/A')}, "
+                  f"Range: {g['range_pct']:.1f}%")
 
         # Process markers
         markers = []
@@ -405,7 +369,7 @@ class PatternScanView(APIView):
             "series_data_ema5": series_data_ema5,
             "series_data_ema10": series_data_ema10,
             "total_consolidation_duration_weeks": round(total_consolidation_duration_weeks, 2),
-            "consolidation_zones": consolidation_groups,  # Changed from nrb_groups
+            "consolidation_zones": consolidation_groups,
             "debug": {
                 "total_rows": total_rows,
                 "ema_rows": ema_rows,
