@@ -15,7 +15,6 @@ from core.pattern_recognition import (
     DEFAULT_COOLDOWN_WEEKS,
     CONSOLIDATION_BUFFER_PCT,
     MIN_CONSOLIDATION_DURATION_WEEKS,
-    # REMOVED: _find_consolidation_zones - no longer needed
 )
 
 from .serializers import SymbolListItemSerializer
@@ -152,7 +151,7 @@ class PatternScanView(APIView):
             symbol__symbol=scrip, ema50__isnull=False
         ).count()
 
-        # 🆕 Get pattern triggers - consolidation zones are now embedded in the triggers
+        # Get pattern triggers - consolidation zones are now embedded in the triggers
         trigger_markers = get_pattern_triggers(
             scrip=scrip,
             pattern=pattern,
@@ -189,9 +188,6 @@ class PatternScanView(APIView):
             "rsc30": "rsc_sensex_ratio",
             "rsc500": "rsc500",
         }
-
-        # 🆕 REMOVED: Weekly data calculation - no longer needed here
-        # Consolidation zones are now calculated inside get_pattern_triggers()
         
         if series in valid_series_fields:
             field_name = valid_series_fields[series]
@@ -264,17 +260,7 @@ class PatternScanView(APIView):
                     for row in param_qs
                 ]
 
-        # 🆕 REMOVED: Separate consolidation zone calculation
-        # Zones are now embedded in trigger_markers from get_pattern_triggers()
-
-        # Build RSC lookup for marker conversion
-        rsc_lookup = {}
-        if series == "rsc30" and series_data:
-            for point in series_data:
-                rsc_lookup[point["time"]] = point["value"]
-
         # 🆕 Extract unique consolidation zones from the trigger markers
-        # Each trigger now includes its zone metadata
         zones_by_id = {}
         if trigger_markers:
             for marker in trigger_markers:
@@ -290,7 +276,6 @@ class PatternScanView(APIView):
                         "max_value": marker.get("zone_max_value"),
                         "avg_value": marker.get("zone_avg_value"),
                         "range_pct": marker.get("zone_range_pct", 0),
-                        # 🆕 Add success rate fields
                         "success_rate_3m": marker.get("zone_success_rate_3m"),
                         "success_rate_6m": marker.get("zone_success_rate_6m"),
                         "success_rate_12m": marker.get("zone_success_rate_12m"),
@@ -302,6 +287,34 @@ class PatternScanView(APIView):
 
         consolidation_groups = list(zones_by_id.values())
 
+        # 🆕 NEW: Extract NRB groups for horizontal lines
+        nrb_groups_by_id = {}
+        if trigger_markers:
+            for marker in trigger_markers:
+                group_id = marker.get("nrb_group_id")
+                if group_id and group_id not in nrb_groups_by_id:
+                    nrb_groups_by_id[group_id] = {
+                        "group_id": group_id,
+                        "group_level": marker.get("group_level"),
+                        "group_start_time": marker.get("group_start_time"),
+                        "group_end_time": marker.get("group_end_time"),
+                        "group_nrb_count": marker.get("group_nrb_count", 1),
+                        "nrb_ids": [],
+                    }
+                
+                if group_id:
+                    nrb_id = marker.get("nrb_id")
+                    if nrb_id and nrb_id not in nrb_groups_by_id[group_id]["nrb_ids"]:
+                        nrb_groups_by_id[group_id]["nrb_ids"].append(nrb_id)
+
+        nrb_groups = list(nrb_groups_by_id.values())
+
+        # Build RSC lookup for marker conversion
+        rsc_lookup = {}
+        if series == "rsc30" and series_data:
+            for point in series_data:
+                rsc_lookup[point["time"]] = point["value"]
+
         # Debug log
         print(f"[VIEW DEBUG] Extracted {len(consolidation_groups)} consolidation zones")
         for g in consolidation_groups:
@@ -312,6 +325,14 @@ class PatternScanView(APIView):
                   f"Success: 3m={g.get('success_rate_3m')}%, "
                   f"6m={g.get('success_rate_6m')}%, "
                   f"12m={g.get('success_rate_12m')}%")
+        
+        print(f"[VIEW DEBUG] Extracted {len(nrb_groups)} NRB groups")
+        for g in nrb_groups:
+            print(f"  Group {g['group_id']}: level={g['group_level']:.2f}, "
+                  f"NRBs={g['group_nrb_count']}, "
+                  f"time range: {datetime.fromtimestamp(g['group_start_time']).strftime('%Y-%m-%d')} "
+                  f"to {datetime.fromtimestamp(g['group_end_time']).strftime('%Y-%m-%d')}")
+
         # Process markers
         markers = []
         for row in trigger_markers:
@@ -342,6 +363,7 @@ class PatternScanView(APIView):
                         range_low = min(rsc_values_in_range)
                         range_high = max(rsc_values_in_range)
 
+            # 🆕 Include group metadata in markers
             markers.append({
                 "time": row["time"],
                 "position": "aboveBar",
@@ -358,6 +380,12 @@ class PatternScanView(APIView):
                 "nr_high": row.get("nr_high"),
                 "nr_low": row.get("nr_low"),
                 "direction": row.get("direction"),
+                # 🆕 NRB Group metadata
+                "nrb_group_id": row.get("nrb_group_id"),
+                "group_level": row.get("group_level"),
+                "group_start_time": row.get("group_start_time"),
+                "group_end_time": row.get("group_end_time"),
+                "group_nrb_count": row.get("group_nrb_count"),
             })
 
         # Calculate total duration
@@ -376,6 +404,8 @@ class PatternScanView(APIView):
             "series_data_ema10": series_data_ema10,
             "total_consolidation_duration_weeks": round(total_consolidation_duration_weeks, 2),
             "consolidation_zones": consolidation_groups,
+            # 🆕 NEW: Add NRB groups for horizontal lines
+            "nrb_groups": nrb_groups,
             "debug": {
                 "total_rows": total_rows,
                 "ema_rows": ema_rows,
@@ -391,12 +421,14 @@ class PatternScanView(APIView):
                 "series_data_ema5_points": len(series_data_ema5),
                 "series_data_ema10_points": len(series_data_ema10),
                 "consolidation_zones_count": len(consolidation_groups),
+                "nrb_groups_count": len(nrb_groups),  # 🆕 NEW
             },
         }
         
         print(f"[VIEW DEBUG] Response data keys: {response_data.keys()}")
         print(f"[VIEW DEBUG] Response total_consolidation_duration_weeks: {response_data.get('total_consolidation_duration_weeks')}")
         print(f"[VIEW DEBUG] Response consolidation_zones count: {len(consolidation_groups)}")
+        print(f"[VIEW DEBUG] Response nrb_groups count: {len(nrb_groups)}")
 
         return Response(response_data, status=status.HTTP_200_OK)
 

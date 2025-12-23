@@ -31,6 +31,9 @@ CONSOLIDATION_BUFFER_PCT = 0.35
 # Minimum duration for a valid consolidation zone (in weeks)
 MIN_CONSOLIDATION_DURATION_WEEKS = 4
 
+# 🆕 NEW: Tolerance for grouping NRBs at same level (5% by default)
+NRB_LEVEL_TOLERANCE_PCT = 0.05
+
 
 def get_pattern_triggers(
     scrip: str,
@@ -56,6 +59,11 @@ def get_pattern_triggers(
       - zone_start_time, zone_end_time
       - zone_duration_weeks
       - zone_min_value, zone_max_value, zone_avg_value
+      - 🆕 nrb_group_id: ID for NRBs at the same level
+      - 🆕 group_start_time: Start time of the group
+      - 🆕 group_end_time: End time of the group
+      - 🆕 group_level: Average breakout level of the group
+      - 🆕 group_nrb_count: Number of NRBs in the group
 
     For Bowl, additional:
       - pattern_id
@@ -65,6 +73,7 @@ def get_pattern_triggers(
     
     🆕 UPDATED: Consolidation zones are now detected AFTER NRB detection,
     and only zones that end with an NRB are kept.
+    🆕 NEW: NRBs are grouped by level to allow horizontal lines to span multiple NRBs.
     """
     series_normalized = (series or "").strip().lower()
 
@@ -94,7 +103,10 @@ def get_pattern_triggers(
             triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             triggers = _attach_daily_breakout_times_price(base_queryset, triggers)
             
-            # Step 2: Find consolidation zones that END with these NRBs
+            # Step 2: Group NRBs at the same level
+            triggers = _group_nrbs_by_level(triggers, tolerance_pct=NRB_LEVEL_TOLERANCE_PCT)
+            
+            # Step 3: Find consolidation zones that END with these NRBs
             consolidation_zones = _find_consolidation_zones_with_nrb(
                 weekly_data, 
                 triggers,
@@ -103,14 +115,14 @@ def get_pattern_triggers(
                 min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
             )
             
-            # Step 3: Calculate success rates for each zone
+            # Step 4: Calculate success rates for each zone
             consolidation_zones = _calculate_zone_success_rates(
                 base_queryset,
                 consolidation_zones,
                 series_field='close'
             )
             
-            # Step 4: Assign each NRB to its consolidation zone
+            # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
             return triggers
@@ -181,7 +193,10 @@ def get_pattern_triggers(
                 param_qs, series_field, triggers
             )
             
-            # Step 2: Find consolidation zones that END with these NRBs
+            # Step 2: Group NRBs at the same level
+            triggers = _group_nrbs_by_level(triggers, tolerance_pct=NRB_LEVEL_TOLERANCE_PCT)
+            
+            # Step 3: Find consolidation zones that END with these NRBs
             consolidation_zones = _find_consolidation_zones_with_nrb(
                 weekly_data,
                 triggers, 
@@ -190,14 +205,14 @@ def get_pattern_triggers(
                 min_duration=MIN_CONSOLIDATION_DURATION_WEEKS
             )
             
-            # Step 3: Calculate success rates for each zone
+            # Step 4: Calculate success rates for each zone
             consolidation_zones = _calculate_zone_success_rates(
                 param_qs,
                 consolidation_zones,
                 series_field=series_field
             )
             
-            # Step 4: Assign each NRB to its consolidation zone
+            # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
             return triggers
@@ -230,6 +245,108 @@ def get_weekly_queryset(base_queryset):
         )
         .order_by("week")
     )
+
+
+def _group_nrbs_by_level(triggers, tolerance_pct=0.05):
+    """
+    🆕 NEW: Group NRBs that occur at approximately the same price level.
+    
+    Algorithm:
+    1. Sort NRBs by time
+    2. For each NRB, check if it's within tolerance_pct of any existing group
+    3. If yes, add it to that group
+    4. If no, create a new group
+    5. Assign group_id, group_start_time, and group_end_time to each NRB
+    
+    Parameters:
+    - triggers: List of NRB trigger dicts with range_high
+    - tolerance_pct: Percentage tolerance for grouping (default: 5%)
+    
+    Returns:
+    - triggers with group metadata added
+    """
+    
+    if not triggers:
+        return triggers
+    
+    print(f"[NRB GROUPING] Grouping {len(triggers)} NRBs with {tolerance_pct*100}% tolerance")
+    
+    # Sort by time
+    sorted_triggers = sorted(triggers, key=lambda t: t.get('time', 0))
+    
+    # Groups: each group is a dict with {level, tolerance_range, nrb_ids, start_time, end_time}
+    groups = []
+    group_id = 1
+    
+    for trigger in sorted_triggers:
+        range_high = trigger.get('range_high')
+        trigger_time = trigger.get('time')
+        nrb_id = trigger.get('nrb_id')
+        
+        if range_high is None or trigger_time is None:
+            continue
+        
+        range_high = float(range_high)
+        
+        # Check if this NRB fits in any existing group
+        matched_group = None
+        
+        for group in groups:
+            group_level = group['level']
+            lower_bound = group_level * (1 - tolerance_pct)
+            upper_bound = group_level * (1 + tolerance_pct)
+            
+            if lower_bound <= range_high <= upper_bound:
+                matched_group = group
+                break
+        
+        if matched_group:
+            # Add to existing group
+            matched_group['nrb_ids'].append(nrb_id)
+            matched_group['end_time'] = trigger_time  # Update end time
+            matched_group['triggers'].append(trigger)
+            
+            # Update group level to be the average of all NRBs in the group
+            all_levels = [t.get('range_high') for t in matched_group['triggers']]
+            matched_group['level'] = sum(all_levels) / len(all_levels)
+            
+            print(f"[NRB GROUPING] NRB #{nrb_id} (level={range_high:.2f}) → Group #{matched_group['id']} (avg level={matched_group['level']:.2f})")
+        
+        else:
+            # Create new group
+            new_group = {
+                'id': group_id,
+                'level': range_high,
+                'nrb_ids': [nrb_id],
+                'start_time': trigger_time,
+                'end_time': trigger_time,
+                'triggers': [trigger]
+            }
+            groups.append(new_group)
+            
+            print(f"[NRB GROUPING] NRB #{nrb_id} (level={range_high:.2f}) → New Group #{group_id}")
+            
+            group_id += 1
+    
+    # Now assign group metadata to each trigger
+    for group in groups:
+        for trigger in group['triggers']:
+            trigger['nrb_group_id'] = group['id']
+            trigger['group_start_time'] = group['start_time']
+            trigger['group_end_time'] = group['end_time']
+            trigger['group_level'] = group['level']
+            trigger['group_nrb_count'] = len(group['nrb_ids'])
+    
+    print(f"[NRB GROUPING] ====== GROUPING SUMMARY ======")
+    print(f"[NRB GROUPING] Total groups: {len(groups)}")
+    for group in groups:
+        start_date = datetime.fromtimestamp(group['start_time']).strftime('%Y-%m-%d')
+        end_date = datetime.fromtimestamp(group['end_time']).strftime('%Y-%m-%d')
+        print(f"[NRB GROUPING]   Group {group['id']}: level={group['level']:.2f}, "
+              f"NRBs={len(group['nrb_ids'])}, {start_date} to {end_date}")
+    print(f"[NRB GROUPING] ================================")
+    
+    return triggers
 
 
 def _calculate_zone_success_rates(queryset, consolidation_zones, series_field='close'):
