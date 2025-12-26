@@ -252,8 +252,6 @@ class PatternScanView(APIView):
 
                     if g_end and value_lookup:
                         end_val = value_lookup.get(g_end)
-                        # If exact timestamp not in lookup (rare), we could skip or find closest.
-                        # Since g_end comes from the data itself, it should match.
                         
                         if end_val is not None and end_val != 0:
                             end_dt = datetime.fromtimestamp(g_end)
@@ -285,12 +283,18 @@ class PatternScanView(APIView):
                         "group_end_time": g_end,
                         "group_duration_weeks": round(duration_weeks, 1),
                         "group_nrb_count": marker.get("group_nrb_count", 1),
-                        "success_rate_3m": success_rate_3m,   # 🆕 Pass to frontend
-                        "success_rate_6m": success_rate_6m,   # 🆕 Pass to frontend
-                        "success_rate_12m": success_rate_12m, # 🆕 Pass to frontend
+                        "success_rate_3m": success_rate_3m,
+                        "success_rate_6m": success_rate_6m,
+                        "success_rate_12m": success_rate_12m,
                         "nrb_ids": [],
+                        "near_touches": marker.get("near_touches", []), # 🆕 Attach near touches
                     }
                 
+                # If we encounter the trigger that carries the touches (usually the first one processed for the group),
+                # update the group.
+                if group_id and marker.get("near_touches"):
+                     nrb_groups_by_id[group_id]["near_touches"] = marker.get("near_touches")
+
                 if group_id:
                     nrb_id = marker.get("nrb_id")
                     if nrb_id and nrb_id not in nrb_groups_by_id[group_id]["nrb_ids"]:

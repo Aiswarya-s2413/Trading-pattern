@@ -31,8 +31,11 @@ CONSOLIDATION_BUFFER_PCT = 0.35
 # Minimum duration for a valid consolidation zone (in weeks)
 MIN_CONSOLIDATION_DURATION_WEEKS = 4
 
-# 🆕 NEW: Tolerance for grouping NRBs at same level (5% by default)
+# Tolerance for grouping NRBs at same level (5% by default)
 NRB_LEVEL_TOLERANCE_PCT = 0.05
+
+# 🆕 NEW: Tolerance for identifying "Near Touch" zones (1.5%)
+NEAR_TOUCH_TOLERANCE_PCT = 0.10
 
 
 def get_pattern_triggers(
@@ -97,6 +100,9 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
+            # 🆕 Step 6: Identify portions of graph close to the Group Level
+            triggers = _attach_proximity_zones(base_queryset, triggers, 'close')
+
             return triggers
 
         # CASE 2: PARAMETER-BASED SERIES
@@ -123,8 +129,7 @@ def get_pattern_triggers(
             )
 
             param_count = param_qs.count()
-            print(f"[NRB DEBUG] Series: {series_normalized}, Field: {series_field}, Rows: {param_count}")
-
+            
             weekly_qs = (
                 param_qs
                 .annotate(week=TruncWeek("trade_date"))
@@ -180,6 +185,9 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
+            # 🆕 Step 6: Identify portions of graph close to the Group Level
+            triggers = _attach_proximity_zones(param_qs, triggers, series_field)
+
             return triggers
 
     elif pattern == "Bowl":
@@ -211,6 +219,95 @@ def get_weekly_queryset(base_queryset):
         .order_by("week")
     )
 
+
+def _attach_proximity_zones(daily_qs, triggers, value_field, tolerance=NEAR_TOUCH_TOLERANCE_PCT):
+    """
+    Identifies continuous daily periods where the value is within 'tolerance' % of the group level.
+    """
+    if not triggers:
+        return triggers
+
+    # 1. Identify Groups and their parameters
+    groups = {}
+    for t in triggers:
+        gid = t.get('nrb_group_id')
+        if gid:
+            if gid not in groups:
+                groups[gid] = {
+                    'level': float(t['group_level']),
+                    'start_ts': t['group_start_time'],
+                    'end_ts': t['group_end_time'],
+                    'target_trigger': t 
+                }
+    
+    if not groups:
+        return triggers
+
+    data_points = list(daily_qs.values('trade_date', value_field).order_by('trade_date'))
+    
+    if not data_points:
+        return triggers
+
+    processed_data = []
+    for d in data_points:
+        val = d.get(value_field)
+        if val is not None:
+            ts = int(datetime.combine(d['trade_date'], datetime.min.time()).timestamp())
+            processed_data.append({'ts': ts, 'val': float(val)})
+
+    for gid, group in groups.items():
+        level = group['level']
+        start_ts = group['start_ts']
+        end_ts = group['end_ts']
+        
+        upper_bound = level * (1 + tolerance)
+        lower_bound = level * (1 - tolerance)
+        
+        touches = []
+        current_touch = None
+        
+        for point in processed_data:
+            ts = point['ts']
+            val = point['val']
+            
+            if ts < start_ts:
+                continue
+            if ts > end_ts:
+                break
+
+            is_close = lower_bound <= val <= upper_bound
+            
+            if is_close:
+                # Calculate deviation percentage (0% = perfect match)
+                diff_pct = abs(val - level) / level * 100
+                
+                if current_touch is None:
+                    current_touch = {
+                        'start_time': ts,
+                        'end_time': ts,
+                        'avg_diff_pct': diff_pct,
+                        'min_diff_pct': diff_pct,
+                        'max_diff_pct': diff_pct,
+                        'count': 1
+                    }
+                else:
+                    current_touch['end_time'] = ts
+                    current_touch['count'] += 1
+                    current_touch['min_diff_pct'] = min(current_touch['min_diff_pct'], diff_pct)
+                    current_touch['max_diff_pct'] = max(current_touch['max_diff_pct'], diff_pct)
+                    n = current_touch['count']
+                    current_touch['avg_diff_pct'] = (current_touch['avg_diff_pct'] * (n-1) + diff_pct) / n
+            else:
+                if current_touch:
+                    touches.append(current_touch)
+                    current_touch = None
+        
+        if current_touch:
+            touches.append(current_touch)
+            
+        group['target_trigger']['near_touches'] = touches
+
+    return triggers
 
 def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars=5):
     """
@@ -818,5 +915,3 @@ def _detect_bowl_pattern(queryset):
         pattern_id += 1
 
     return result
-
-
