@@ -23,18 +23,11 @@ from .utils import relevance
 
 
 class SymbolListView(APIView):
-    """
-    Unified symbol + index search with pagination + sector info.
-    """
-
     pagination_class = SymbolPagination
 
     def get(self, request, *args, **kwargs):
         query = request.query_params.get("q", "").strip()
 
-        # ================================
-        # 1. Load Symbols (with sector)
-        # ================================
         symbol_qs = (
             Symbol.objects
             .filter(eodprice__isnull=False)
@@ -49,11 +42,7 @@ class SymbolListView(APIView):
             )
 
         symbol_qs = symbol_qs.values(
-            "id",
-            "symbol",
-            "company_name",
-            "sector__name",
-            "sector_id",
+            "id", "symbol", "company_name", "sector__name", "sector_id",
         )
 
         symbol_list = [
@@ -68,9 +57,6 @@ class SymbolListView(APIView):
             for s in symbol_qs
         ]
 
-        # ================================
-        # 2. Load Indices
-        # ================================
         index_qs = (
             Index.objects
             .filter(indexprice__isnull=False)
@@ -97,15 +83,9 @@ class SymbolListView(APIView):
             for idx in index_qs
         ]
 
-        # ================================
-        # 3. Merge & Sort (using relevance)
-        # ================================
         combined = symbol_list + index_list
         combined = sorted(combined, key=lambda x: relevance(x, query))
 
-        # ================================
-        # 4. Pagination
-        # ================================
         paginator = self.pagination_class()
         paginated_data = paginator.paginate_queryset(combined, request)
 
@@ -118,40 +98,30 @@ class PatternScanView(APIView):
         try:
             scrip = request.query_params.get("scrip")
             pattern = request.query_params.get("pattern")
-
             nrb_lookback = NRB_LOOKBACK
-
             success_rate_raw = request.query_params.get("success_rate", "0")
             success_rate = float(success_rate_raw) if success_rate_raw != "" else 0.0
-
             weeks_param = request.query_params.get("weeks")
             weeks = int(weeks_param) if weeks_param is not None else None
-
             series_param = request.query_params.get("series")
             series = series_param.strip().lower() if series_param else None
-
             cooldown_weeks_param = request.query_params.get("cooldown_weeks")
             cooldown_weeks = int(cooldown_weeks_param) if cooldown_weeks_param else DEFAULT_COOLDOWN_WEEKS
 
             if not scrip or not pattern:
-                print("Scrip and Pattern are required.", scrip, pattern)
                 return Response(
                     {"error": "Scrip and Pattern are required."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-
         except ValueError:
             return Response(
-                {"error": "Invalid numerical input for success_rate, weeks, or cooldown_weeks."},
+                {"error": "Invalid numerical input."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         total_rows = EodPrice.objects.filter(symbol__symbol=scrip).count()
-        ema_rows = Parameter.objects.filter(
-            symbol__symbol=scrip, ema50__isnull=False
-        ).count()
+        ema_rows = Parameter.objects.filter(symbol__symbol=scrip, ema50__isnull=False).count()
 
-        # Get pattern triggers - consolidation zones are now embedded in the triggers
         trigger_markers = get_pattern_triggers(
             scrip=scrip,
             pattern=pattern,
@@ -165,9 +135,7 @@ class PatternScanView(APIView):
         ohlcv_qs = EodPrice.objects.filter(symbol__symbol=scrip).order_by("trade_date")
         ohlcv_data = [
             {
-                "time": int(
-                    datetime.combine(row.trade_date, datetime.min.time()).timestamp()
-                ),
+                "time": int(datetime.combine(row.trade_date, datetime.min.time()).timestamp()),
                 "open": row.open,
                 "high": row.high,
                 "low": row.low,
@@ -176,7 +144,6 @@ class PatternScanView(APIView):
             for row in ohlcv_qs
         ]
 
-        # ----- series_data for Parameter-based filters -----
         series_data = []
         series_data_ema5 = []
         series_data_ema10 = []
@@ -191,76 +158,35 @@ class PatternScanView(APIView):
         
         if series in valid_series_fields:
             field_name = valid_series_fields[series]
-            
             if series == "rsc30":
                 param_qs = (
                     Parameter.objects.filter(symbol__symbol=scrip)
                     .exclude(rsc_sensex_ratio__isnull=True)
                     .order_by("trade_date")
                 )
-
-                # GRAY LINE - Raw ratio
                 series_data = [
-                    {
-                        "time": int(
-                            datetime.combine(
-                                row.trade_date, datetime.min.time()
-                            ).timestamp()
-                        ),
-                        "value": float(row.rsc_sensex_ratio),
-                    }
-                    for row in param_qs
-                    if row.rsc_sensex_ratio is not None
+                    {"time": int(datetime.combine(row.trade_date, datetime.min.time()).timestamp()), "value": float(row.rsc_sensex_ratio)}
+                    for row in param_qs if row.rsc_sensex_ratio is not None
                 ]
-
-                # RED LINE - EMA5
                 series_data_ema5 = [
-                    {
-                        "time": int(
-                            datetime.combine(
-                                row.trade_date, datetime.min.time()
-                            ).timestamp()
-                        ),
-                        "value": float(row.rsc_sensex_ema5),
-                    }
-                    for row in param_qs
-                    if row.rsc_sensex_ema5 is not None
+                    {"time": int(datetime.combine(row.trade_date, datetime.min.time()).timestamp()), "value": float(row.rsc_sensex_ema5)}
+                    for row in param_qs if row.rsc_sensex_ema5 is not None
                 ]
-
-                # BLUE LINE - EMA10
                 series_data_ema10 = [
-                    {
-                        "time": int(
-                            datetime.combine(
-                                row.trade_date, datetime.min.time()
-                            ).timestamp()
-                        ),
-                        "value": float(row.rsc_sensex_ema10),
-                    }
-                    for row in param_qs
-                    if row.rsc_sensex_ema10 is not None
+                    {"time": int(datetime.combine(row.trade_date, datetime.min.time()).timestamp()), "value": float(row.rsc_sensex_ema10)}
+                    for row in param_qs if row.rsc_sensex_ema10 is not None
                 ]
-
             else:
                 param_qs = (
                     Parameter.objects.filter(symbol__symbol=scrip)
                     .exclude(**{f"{field_name}__isnull": True})
                     .order_by("trade_date")
                 )
-
                 series_data = [
-                    {
-                        "time": int(
-                            datetime.combine(
-                                row.trade_date, datetime.min.time()
-                            ).timestamp()
-                        ),
-                        "value": float(getattr(row, field_name)),
-                    }
+                    {"time": int(datetime.combine(row.trade_date, datetime.min.time()).timestamp()), "value": float(getattr(row, field_name))}
                     for row in param_qs
                 ]
 
-        # 🆕 Extract unique consolidation zones from the trigger markers
         zones_by_id = {}
         if trigger_markers:
             for marker in trigger_markers:
@@ -281,13 +207,11 @@ class PatternScanView(APIView):
                         "success_rate_12m": marker.get("zone_success_rate_12m"),
                         "num_nrbs": 0,
                     }
-                
                 if zone_id:
                     zones_by_id[zone_id]["num_nrbs"] += 1
 
         consolidation_groups = list(zones_by_id.values())
 
-        # 🆕 NEW: Extract NRB groups for horizontal lines
         nrb_groups_by_id = {}
         if trigger_markers:
             for marker in trigger_markers:
@@ -301,7 +225,6 @@ class PatternScanView(APIView):
                         "group_nrb_count": marker.get("group_nrb_count", 1),
                         "nrb_ids": [],
                     }
-                
                 if group_id:
                     nrb_id = marker.get("nrb_id")
                     if nrb_id and nrb_id not in nrb_groups_by_id[group_id]["nrb_ids"]:
@@ -309,61 +232,29 @@ class PatternScanView(APIView):
 
         nrb_groups = list(nrb_groups_by_id.values())
 
-        # Build RSC lookup for marker conversion
         rsc_lookup = {}
         if series == "rsc30" and series_data:
             for point in series_data:
                 rsc_lookup[point["time"]] = point["value"]
 
-        # Debug log
-        print(f"[VIEW DEBUG] Extracted {len(consolidation_groups)} consolidation zones")
-        for g in consolidation_groups:
-            print(f"  Zone {g['zone_id']}: {g['num_nrbs']} NRBs, "
-                  f"{g['duration_weeks']:.2f} weeks, "
-                  f"First value: {g.get('first_value', 'N/A')}, "
-                  f"Range: {g['range_pct']:.1f}%, "
-                  f"Success: 3m={g.get('success_rate_3m')}%, "
-                  f"6m={g.get('success_rate_6m')}%, "
-                  f"12m={g.get('success_rate_12m')}%")
-        
-        print(f"[VIEW DEBUG] Extracted {len(nrb_groups)} NRB groups")
-        for g in nrb_groups:
-            print(f"  Group {g['group_id']}: level={g['group_level']:.2f}, "
-                  f"NRBs={g['group_nrb_count']}, "
-                  f"time range: {datetime.fromtimestamp(g['group_start_time']).strftime('%Y-%m-%d')} "
-                  f"to {datetime.fromtimestamp(g['group_end_time']).strftime('%Y-%m-%d')}")
-
-        # Process markers
         markers = []
         for row in trigger_markers:
             score = row.get("score", 0.0)
             pattern_id = row.get("pattern_id")
+            text = f"Bowl Pattern #{pattern_id} | Score: {score:.2f}" if pattern == "Bowl" and pattern_id is not None else f"Pattern: {pattern} | Success Score: {score:.2f}"
 
-            if pattern == "Bowl" and pattern_id is not None:
-                text = f"Bowl Pattern #{pattern_id} | Score: {score:.2f}"
-            else:
-                text = f"Pattern: {pattern} | Success Score: {score:.2f}"
-
-            # Get original range values
             range_low = row.get("range_low")
             range_high = row.get("range_high")
             
-            # Convert to RSC scale if needed
             if series == "rsc30" and range_low is not None and range_high is not None:
                 range_start_time = row.get("range_start_time")
                 range_end_time = row.get("range_end_time")
-                
                 if range_start_time and range_end_time:
-                    rsc_values_in_range = [
-                        v for t, v in rsc_lookup.items() 
-                        if range_start_time <= t <= range_end_time
-                    ]
-                    
+                    rsc_values_in_range = [v for t, v in rsc_lookup.items() if range_start_time <= t <= range_end_time]
                     if rsc_values_in_range:
                         range_low = min(rsc_values_in_range)
                         range_high = max(rsc_values_in_range)
 
-            # 🆕 Include group metadata in markers
             markers.append({
                 "time": row["time"],
                 "position": "aboveBar",
@@ -380,7 +271,6 @@ class PatternScanView(APIView):
                 "nr_high": row.get("nr_high"),
                 "nr_low": row.get("nr_low"),
                 "direction": row.get("direction"),
-                # 🆕 NRB Group metadata
                 "nrb_group_id": row.get("nrb_group_id"),
                 "group_level": row.get("group_level"),
                 "group_start_time": row.get("group_start_time"),
@@ -388,10 +278,7 @@ class PatternScanView(APIView):
                 "group_nrb_count": row.get("group_nrb_count"),
             })
 
-        # Calculate total duration
-        total_consolidation_duration_weeks = sum(
-            z.get("duration_weeks", 0) for z in consolidation_groups
-        ) if consolidation_groups else 0
+        total_consolidation_duration_weeks = sum(z.get("duration_weeks", 0) for z in consolidation_groups) if consolidation_groups else 0
 
         response_data = {
             "scrip": scrip,
@@ -404,7 +291,6 @@ class PatternScanView(APIView):
             "series_data_ema10": series_data_ema10,
             "total_consolidation_duration_weeks": round(total_consolidation_duration_weeks, 2),
             "consolidation_zones": consolidation_groups,
-            # 🆕 NEW: Add NRB groups for horizontal lines
             "nrb_groups": nrb_groups,
             "debug": {
                 "total_rows": total_rows,
@@ -418,185 +304,79 @@ class PatternScanView(APIView):
                 "nrb_default_lookback": NRB_LOOKBACK,
                 "series_param": series,
                 "series_data_points": len(series_data),
-                "series_data_ema5_points": len(series_data_ema5),
-                "series_data_ema10_points": len(series_data_ema10),
                 "consolidation_zones_count": len(consolidation_groups),
-                "nrb_groups_count": len(nrb_groups),  # 🆕 NEW
+                "nrb_groups_count": len(nrb_groups),
             },
         }
-        
-        print(f"[VIEW DEBUG] Response data keys: {response_data.keys()}")
-        print(f"[VIEW DEBUG] Response total_consolidation_duration_weeks: {response_data.get('total_consolidation_duration_weeks')}")
-        print(f"[VIEW DEBUG] Response consolidation_zones count: {len(consolidation_groups)}")
-        print(f"[VIEW DEBUG] Response nrb_groups count: {len(nrb_groups)}")
 
         return Response(response_data, status=status.HTTP_200_OK)
 
 
 class PriceHistoryView(APIView):
-    """
-    Fetch historical OHLC price data for a given scrip (Symbol or Index).
-    """
-
-    CACHE_TIMEOUT = 60 * 60 * 24   # 24 hours
+    CACHE_TIMEOUT = 60 * 60 * 24
 
     def get(self, request, *args, **kwargs):
-
-        # ================================
-        # Validate Inputs
-        # ================================
         scrip = request.query_params.get("scrip")
         years_raw = request.query_params.get("years", 10)
 
         if not scrip:
-            return Response(
-                {"error": "Query parameter 'scrip' is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"error": "Query parameter 'scrip' is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             years = int(years_raw)
-            if years <= 0:
-                raise ValueError
+            if years <= 0: raise ValueError
         except:
-            return Response(
-                {"error": "'years' must be a positive integer."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"error": "'years' must be a positive integer."}, status=status.HTTP_400_BAD_REQUEST)
 
         cutoff_date = date.today() - timedelta(days=years * 365)
-
-        # ================================
-        # Caching Layer
-        # ================================
         cache_key = f"price-history:{scrip}:{years}"
         cached = cache.get(cache_key)
         if cached:
             return Response(cached, status=status.HTTP_200_OK)
 
-        # ================================
-        # Determine if scrip is a Symbol or Index
-        # ================================
         symbol_obj = Symbol.objects.filter(symbol=scrip).first()
         index_obj = Index.objects.filter(symbol=scrip).first()
 
         if not symbol_obj and not index_obj:
-            return Response(
-                {"error": f"No stock or index found with symbol '{scrip}'."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return Response({"error": f"No stock or index found with symbol '{scrip}'."}, status=status.HTTP_404_NOT_FOUND)
 
-        # ================================
-        # Query the correct price table
-        # ================================
         if symbol_obj:
-            price_qs = (
-                EodPrice.objects
-                .filter(symbol=symbol_obj, trade_date__gte=cutoff_date)
-                .order_by("trade_date")
-                .values("trade_date", "open", "high", "low", "close")
-            )
+            price_qs = EodPrice.objects.filter(symbol=symbol_obj, trade_date__gte=cutoff_date).order_by("trade_date").values("trade_date", "open", "high", "low", "close")
         else:
-            price_qs = (
-                IndexPrice.objects
-                .filter(index=index_obj, trade_date__gte=cutoff_date)
-                .order_by("trade_date")
-                .values("trade_date", "open", "high", "low", "close")
-            )
+            price_qs = IndexPrice.objects.filter(index=index_obj, trade_date__gte=cutoff_date).order_by("trade_date").values("trade_date", "open", "high", "low", "close")
 
         if not price_qs.exists():
-            return Response(
-                {"error": "No price data for the given scrip in the selected date range."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+            return Response({"error": "No price data for the given scrip in the selected date range."}, status=status.HTTP_404_NOT_FOUND)
 
-        # ================================
-        # Serialize data
-        # ================================
         price_data = [
-            {
-                "time": int(datetime.combine(row["trade_date"], datetime.min.time()).timestamp()),
-                "open": row["open"],
-                "high": row["high"],
-                "low": row["low"],
-                "close": row["close"],
-            }
+            {"time": int(datetime.combine(row["trade_date"], datetime.min.time()).timestamp()), "open": row["open"], "high": row["high"], "low": row["low"], "close": row["close"]}
             for row in price_qs
         ]
 
-        response = {
-            "scrip": scrip,
-            "price_data": price_data,
-            "records": len(price_data),
-        }
-
+        response = {"scrip": scrip, "price_data": price_data, "records": len(price_data)}
         cache.set(cache_key, response, timeout=self.CACHE_TIMEOUT)
-
         return Response(response, status=status.HTTP_200_OK)
 
 
 class Week52HighView(APIView):
-    """
-    Returns the 52-week high for a scrip.
-    Supports both Symbol (stocks) and Index (Sensex, Nifty500).
-    """
-
     def get(self, request, *args, **kwargs):
         scrip = request.query_params.get("scrip")
         if not scrip:
-            return Response(
-                {"error": "Query parameter 'scrip' is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return Response({"error": "Query parameter 'scrip' is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         cutoff_date = date.today() - timedelta(days=365)
-
         stock_exists = Symbol.objects.filter(symbol=scrip).exists()
 
         if stock_exists:
-            data = (
-                EodPrice.objects.filter(
-                    symbol__symbol=scrip,
-                    trade_date__gte=cutoff_date
-                )
-                .aggregate(week52_high=Max("high"))
-            )
+            data = EodPrice.objects.filter(symbol__symbol=scrip, trade_date__gte=cutoff_date).aggregate(week52_high=Max("high"))
         else:
             index_exists = Index.objects.filter(symbol=scrip).exists()
-
             if not index_exists:
-                return Response(
-                    {
-                        "error": f"'{scrip}' is not a valid symbol or index.",
-                    },
-                    status=status.HTTP_404_NOT_FOUND,
-                )
-
-            data = (
-                IndexPrice.objects.filter(
-                    index__symbol=scrip,
-                    trade_date__gte=cutoff_date
-                )
-                .aggregate(week52_high=Max("high"))
-            )
+                return Response({"error": f"'{scrip}' is not a valid symbol or index."}, status=status.HTTP_404_NOT_FOUND)
+            data = IndexPrice.objects.filter(index__symbol=scrip, trade_date__gte=cutoff_date).aggregate(week52_high=Max("high"))
 
         week52_high = data.get("week52_high")
-
         if week52_high is None:
-            return Response(
-                {
-                    "scrip": scrip,
-                    "52week_high": None,
-                    "message": "No price data found for the past 52 weeks.",
-                },
-                status=status.HTTP_200_OK,
-            )
+            return Response({"scrip": scrip, "52week_high": None, "message": "No price data found for the past 52 weeks."}, status=status.HTTP_200_OK)
 
-        return Response(
-            {
-                "scrip": scrip,
-                "52week_high": float(week52_high),
-                "cutoff_date": cutoff_date.isoformat(),
-            },
-            status=status.HTTP_200_OK,
-        )
+        return Response({"scrip": scrip, "52week_high": float(week52_high), "cutoff_date": cutoff_date.isoformat()}, status=status.HTTP_200_OK)
