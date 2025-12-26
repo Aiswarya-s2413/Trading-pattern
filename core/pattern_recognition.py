@@ -247,20 +247,22 @@ def get_weekly_queryset(base_queryset):
     )
 
 
-def _group_nrbs_by_level(triggers, tolerance_pct=0.05):
+def _group_nrbs_by_level(triggers, tolerance_pct=0.05, max_gap_bars=5):
     """
-    🆕 NEW: Group NRBs that occur at approximately the same price level.
+    🆕 NEW: Group NRBs that occur at approximately the same price level AND are consecutive.
     
     Algorithm:
     1. Sort NRBs by time
-    2. For each NRB, check if it's within tolerance_pct of any existing group
+    2. For each NRB, check if it's within tolerance_pct of any RECENT group (within max_gap_bars)
     3. If yes, add it to that group
     4. If no, create a new group
-    5. Assign group_id, group_start_time, and group_end_time to each NRB
+    5. Close groups that haven't seen activity within max_gap_bars
+    6. Assign group_id, group_start_time, and group_end_time to each NRB
     
     Parameters:
     - triggers: List of NRB trigger dicts with range_high
     - tolerance_pct: Percentage tolerance for grouping (default: 5%)
+    - max_gap_bars: Maximum number of bars between NRBs to stay in same group (default: 10)
     
     Returns:
     - triggers with group metadata added
@@ -269,16 +271,17 @@ def _group_nrbs_by_level(triggers, tolerance_pct=0.05):
     if not triggers:
         return triggers
     
-    print(f"[NRB GROUPING] Grouping {len(triggers)} NRBs with {tolerance_pct*100}% tolerance")
+    print(f"[NRB GROUPING] Grouping {len(triggers)} NRBs with {tolerance_pct*100}% tolerance, max gap={max_gap_bars} bars")
     
     # Sort by time
     sorted_triggers = sorted(triggers, key=lambda t: t.get('time', 0))
     
-    # Groups: each group is a dict with {level, tolerance_range, nrb_ids, start_time, end_time}
-    groups = []
+    # Groups: each group is a dict with {level, tolerance_range, nrb_ids, start_time, end_time, last_nrb_index}
+    active_groups = []  # Groups that can still accept new NRBs
+    closed_groups = []  # Groups that are closed
     group_id = 1
     
-    for trigger in sorted_triggers:
+    for idx, trigger in enumerate(sorted_triggers):
         range_high = trigger.get('range_high')
         trigger_time = trigger.get('time')
         nrb_id = trigger.get('nrb_id')
@@ -288,10 +291,22 @@ def _group_nrbs_by_level(triggers, tolerance_pct=0.05):
         
         range_high = float(range_high)
         
-        # Check if this NRB fits in any existing group
+        # Close groups that are too far behind (more than max_gap_bars since last NRB)
+        groups_to_close = []
+        for group in active_groups:
+            gap = idx - group['last_nrb_index']
+            if gap > max_gap_bars:
+                groups_to_close.append(group)
+        
+        for group in groups_to_close:
+            active_groups.remove(group)
+            closed_groups.append(group)
+            print(f"[NRB GROUPING] 🔒 Closing Group #{group['id']} (gap exceeded {max_gap_bars} bars)")
+        
+        # Check if this NRB fits in any ACTIVE group
         matched_group = None
         
-        for group in groups:
+        for group in active_groups:
             group_level = group['level']
             lower_bound = group_level * (1 - tolerance_pct)
             upper_bound = group_level * (1 + tolerance_pct)
@@ -304,6 +319,7 @@ def _group_nrbs_by_level(triggers, tolerance_pct=0.05):
             # Add to existing group
             matched_group['nrb_ids'].append(nrb_id)
             matched_group['end_time'] = trigger_time  # Update end time
+            matched_group['last_nrb_index'] = idx  # Update last NRB index
             matched_group['triggers'].append(trigger)
             
             # Update group level to be the average of all NRBs in the group
@@ -313,6 +329,14 @@ def _group_nrbs_by_level(triggers, tolerance_pct=0.05):
             print(f"[NRB GROUPING] NRB #{nrb_id} (level={range_high:.2f}) → Group #{matched_group['id']} (avg level={matched_group['level']:.2f})")
         
         else:
+            # Check if level matches a CLOSED group (this would create a NEW group at same level)
+            similar_closed = [g for g in closed_groups 
+                            if g['level'] * (1 - tolerance_pct) <= range_high <= g['level'] * (1 + tolerance_pct)]
+            
+            if similar_closed:
+                print(f"[NRB GROUPING] 🆕 NRB #{nrb_id} (level={range_high:.2f}) matches closed Group #{similar_closed[0]['id']} "
+                      f"but creating NEW group due to gap")
+            
             # Create new group
             new_group = {
                 'id': group_id,
@@ -320,16 +344,20 @@ def _group_nrbs_by_level(triggers, tolerance_pct=0.05):
                 'nrb_ids': [nrb_id],
                 'start_time': trigger_time,
                 'end_time': trigger_time,
+                'last_nrb_index': idx,
                 'triggers': [trigger]
             }
-            groups.append(new_group)
+            active_groups.append(new_group)
             
             print(f"[NRB GROUPING] NRB #{nrb_id} (level={range_high:.2f}) → New Group #{group_id}")
             
             group_id += 1
     
+    # Close all remaining active groups
+    all_groups = closed_groups + active_groups
+    
     # Now assign group metadata to each trigger
-    for group in groups:
+    for group in all_groups:
         for trigger in group['triggers']:
             trigger['nrb_group_id'] = group['id']
             trigger['group_start_time'] = group['start_time']
@@ -338,12 +366,13 @@ def _group_nrbs_by_level(triggers, tolerance_pct=0.05):
             trigger['group_nrb_count'] = len(group['nrb_ids'])
     
     print(f"[NRB GROUPING] ====== GROUPING SUMMARY ======")
-    print(f"[NRB GROUPING] Total groups: {len(groups)}")
-    for group in groups:
+    print(f"[NRB GROUPING] Total groups: {len(all_groups)}")
+    for group in sorted(all_groups, key=lambda g: g['id']):
         start_date = datetime.fromtimestamp(group['start_time']).strftime('%Y-%m-%d')
         end_date = datetime.fromtimestamp(group['end_time']).strftime('%Y-%m-%d')
+        nrb_ids = ', '.join([f"#{nid}" for nid in group['nrb_ids']])
         print(f"[NRB GROUPING]   Group {group['id']}: level={group['level']:.2f}, "
-              f"NRBs={len(group['nrb_ids'])}, {start_date} to {end_date}")
+              f"NRBs={len(group['nrb_ids'])} ({nrb_ids}), {start_date} to {end_date}")
     print(f"[NRB GROUPING] ================================")
     
     return triggers
