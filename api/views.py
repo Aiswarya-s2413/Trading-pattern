@@ -15,6 +15,7 @@ from core.pattern_recognition import (
     DEFAULT_COOLDOWN_WEEKS,
     CONSOLIDATION_BUFFER_PCT,
     MIN_CONSOLIDATION_DURATION_WEEKS,
+    NEAR_TOUCH_TOLERANCE_PCT, # 🆕 Added Import
 )
 
 from .serializers import SymbolListItemSerializer
@@ -287,7 +288,7 @@ class PatternScanView(APIView):
                         "success_rate_6m": success_rate_6m,
                         "success_rate_12m": success_rate_12m,
                         "nrb_ids": [],
-                        "near_touches": marker.get("near_touches", []), # 🆕 Attach near touches
+                        "near_touches": marker.get("near_touches", []), # Attach near touches
                     }
                 
                 # If we encounter the trigger that carries the touches (usually the first one processed for the group),
@@ -376,6 +377,7 @@ class PatternScanView(APIView):
                 "series_data_points": len(series_data),
                 "consolidation_zones_count": len(consolidation_groups),
                 "nrb_groups_count": len(nrb_groups),
+                "near_touch_tolerance_pct": NEAR_TOUCH_TOLERANCE_PCT, # 🆕 Added to debug
             },
         }
 

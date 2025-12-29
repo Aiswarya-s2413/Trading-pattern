@@ -34,7 +34,7 @@ MIN_CONSOLIDATION_DURATION_WEEKS = 4
 # Tolerance for grouping NRBs at same level (5% by default)
 NRB_LEVEL_TOLERANCE_PCT = 0.05
 
-# 🆕 NEW: Tolerance for identifying "Near Touch" zones (1.5%)
+# Tolerance for identifying "Near Touch" zones (10%)
 NEAR_TOUCH_TOLERANCE_PCT = 0.10
 
 
@@ -78,7 +78,7 @@ def get_pattern_triggers(
             triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             triggers = _attach_daily_breakout_times_price(base_queryset, triggers)
             
-            # Step 2: Group NRBs at the same level (Checking for price violation)
+            # Step 2: Group NRBs at the same level
             triggers = _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=NRB_LEVEL_TOLERANCE_PCT)
             
             # Step 3: Find consolidation zones that END with these NRBs
@@ -100,7 +100,10 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
-            # 🆕 Step 6: Identify portions of graph close to the Group Level
+            # 🆕 Step 6: Extend Group Line (Checking for Violations)
+            triggers = _extend_group_lifespan_to_history(base_queryset, triggers, 'high', tolerance=NRB_LEVEL_TOLERANCE_PCT)
+
+            # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(base_queryset, triggers, 'close')
 
             return triggers
@@ -128,8 +131,6 @@ def get_pattern_triggers(
                 .order_by("trade_date")
             )
 
-            param_count = param_qs.count()
-            
             weekly_qs = (
                 param_qs
                 .annotate(week=TruncWeek("trade_date"))
@@ -163,7 +164,7 @@ def get_pattern_triggers(
                 param_qs, series_field, triggers
             )
             
-            # Step 2: Group NRBs at the same level (Checking for price violation)
+            # Step 2: Group NRBs at the same level
             triggers = _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=NRB_LEVEL_TOLERANCE_PCT)
             
             # Step 3: Find consolidation zones that END with these NRBs
@@ -185,7 +186,10 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
-            # 🆕 Step 6: Identify portions of graph close to the Group Level
+            # 🆕 Step 6: Extend Group Line (Checking for Violations)
+            triggers = _extend_group_lifespan_to_history(param_qs, triggers, series_field, tolerance=NRB_LEVEL_TOLERANCE_PCT)
+
+            # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(param_qs, triggers, series_field)
 
             return triggers
@@ -218,6 +222,124 @@ def get_weekly_queryset(base_queryset):
         )
         .order_by("week")
     )
+
+
+def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance=0.05):
+    """
+    🆕 UPDATED: Extends the start and end times of an NRB group to cover historical values.
+    CRITICAL: It stops extending if the price goes ABOVE the line (violation).
+    """
+    if not triggers:
+        return triggers
+
+    # 1. Map groups
+    groups = {}
+    for t in triggers:
+        gid = t.get('nrb_group_id')
+        if gid:
+            if gid not in groups:
+                groups[gid] = {
+                    'level': float(t['group_level']),
+                    'start_ts': t['group_start_time'],
+                    'end_ts': t['group_end_time'],
+                    'triggers': []
+                }
+            groups[gid]['triggers'].append(t)
+    
+    if not groups:
+        return triggers
+
+    # 2. Get data efficiently
+    # We need 'high' to check for violations if value_field is 'high' or 'close'
+    # For parameters, value_field is the single value.
+    if value_field == 'high':
+        data_points = list(daily_qs.values('trade_date', 'high').order_by('trade_date'))
+        val_key = 'high'
+    elif value_field == 'close':
+        # Even if scanning 'close', we check 'high' for violation usually, 
+        # but to keep it generic for parameters, we stick to the field requested or check 'high' if available.
+        # For simplicity here, we use the passed value_field for both touch and violation.
+        data_points = list(daily_qs.values('trade_date', value_field).order_by('trade_date'))
+        val_key = value_field
+    else:
+        data_points = list(daily_qs.values('trade_date', value_field).order_by('trade_date'))
+        val_key = value_field
+
+    if not data_points:
+        return triggers
+        
+    processed_data = []
+    for d in data_points:
+        val = d.get(val_key)
+        if val is not None:
+            ts = int(datetime.combine(d['trade_date'], datetime.min.time()).timestamp())
+            processed_data.append({'ts': ts, 'val': float(val)})
+
+    # 3. Extend with Violation Check
+    for gid, group in groups.items():
+        level = group['level']
+        upper = level * (1 + tolerance)
+        lower = level * (1 - tolerance)
+        
+        current_start_ts = group['start_ts']
+        current_end_ts = group['end_ts']
+        
+        final_start_ts = current_start_ts
+        final_end_ts = current_end_ts
+        
+        # --- Extend Left (Backwards) ---
+        # Find index of current start
+        start_idx = -1
+        # Optimization: Binary search is better, but simple loop is safer for now
+        for i, p in enumerate(processed_data):
+            if p['ts'] >= current_start_ts:
+                start_idx = i
+                break
+        
+        if start_idx == -1: start_idx = len(processed_data) - 1
+
+        # Walk backwards
+        if start_idx > 0:
+            for i in range(start_idx - 1, -1, -1):
+                p = processed_data[i]
+                
+                # Check for VIOLATION (Price above line)
+                if p['val'] > upper:
+                    # Violation found, STOP extending left
+                    break
+                
+                # Check for VALID TOUCH (Price on line)
+                if lower <= p['val'] <= upper:
+                    final_start_ts = p['ts']
+                
+                # If price is below lower (gap), we continue walking
+                # hoping to find another touch earlier.
+
+        # --- Extend Right (Forwards) ---
+        end_idx = -1
+        for i, p in enumerate(processed_data):
+            if p['ts'] >= current_end_ts:
+                end_idx = i
+                break
+        
+        if end_idx != -1:
+            for i in range(end_idx + 1, len(processed_data)):
+                p = processed_data[i]
+                
+                # Check for VIOLATION
+                if p['val'] > upper:
+                    break
+                
+                # Check for VALID TOUCH
+                if lower <= p['val'] <= upper:
+                    final_end_ts = p['ts']
+
+        # Apply updates
+        for t in group['triggers']:
+            t['group_start_time'] = final_start_ts
+            t['group_end_time'] = final_end_ts
+
+    return triggers
 
 
 def _attach_proximity_zones(daily_qs, triggers, value_field, tolerance=NEAR_TOUCH_TOLERANCE_PCT):
@@ -309,30 +431,16 @@ def _attach_proximity_zones(daily_qs, triggers, value_field, tolerance=NEAR_TOUC
 
     return triggers
 
+
 def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars=5):
     """
-    🆕 UPDATED: Group NRBs at same price level, checking for intermediate breakouts.
-    
-    Algorithm:
-    1. Sort NRBs by time.
-    2. Check fit in ACTIVE groups (tolerance & time gap).
-    3. 🆕 VIOLATION CHECK: If grouping is technically possible based on level,
-       check the price data between the Last NRB in the group and the Current NRB.
-       If Price > Group Level (breakout), we CANNOT extend the line.
-    4. Close groups, create new groups.
-    
-    Parameters:
-    - triggers: List of NRB trigger dicts.
-    - weekly_data: List of weekly data dicts (must contain 'date' and 'high').
+    Groups NRBs at same price level, checking for intermediate breakouts.
     """
-    
     if not triggers:
         return triggers
     
     print(f"[NRB GROUPING] Grouping {len(triggers)} NRBs with {tolerance_pct*100}% tolerance")
     
-    # Pre-process weekly data for fast timestamp-based lookup
-    # List of tuples: (timestamp, high_value)
     price_lookup = []
     if weekly_data:
         for row in weekly_data:
@@ -342,10 +450,7 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
                 high_val = float(row.get('high', 0))
                 price_lookup.append({'time': ts, 'high': high_val})
     
-    # Sort price lookup by time just in case
     price_lookup.sort(key=lambda x: x['time'])
-
-    # Sort triggers by time
     sorted_triggers = sorted(triggers, key=lambda t: t.get('time', 0))
     
     active_groups = []
@@ -362,7 +467,6 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
         
         range_high = float(range_high)
         
-        # 1. Close groups based on GAP
         groups_to_close = []
         for group in active_groups:
             gap = idx - group['last_nrb_index']
@@ -374,7 +478,6 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
             closed_groups.append(group)
             print(f"[NRB GROUPING] 🔒 Closing Group #{group['id']} (Gap > {max_gap_bars})")
         
-        # 2. Check if this NRB fits in any ACTIVE group
         matched_group = None
         
         for group in active_groups:
@@ -382,22 +485,12 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
             lower_bound = group_level * (1 - tolerance_pct)
             upper_bound = group_level * (1 + tolerance_pct)
             
-            # Level check
             if lower_bound <= range_high <= upper_bound:
-                
-                # 🆕 PRICE VIOLATION CHECK
-                # Ensure price didn't go ABOVE the group level between last NRB and this NRB
                 last_time = group['end_time']
                 current_time = trigger_time
-                
-                # We use the upper bound of the tolerance as the "Line" ceiling
-                # If price went above this, the line was broken.
                 violation_threshold = upper_bound 
-                
                 is_violated = False
                 
-                # Scan prices between the two NRBs
-                # Optimization: Binary search could be used, but linear scan for filtered range is okay
                 for candle in price_lookup:
                     if last_time < candle['time'] < current_time:
                         if candle['high'] > violation_threshold:
@@ -414,20 +507,15 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
                     break
         
         if matched_group:
-            # Add to existing group
             matched_group['nrb_ids'].append(nrb_id)
             matched_group['end_time'] = trigger_time
             matched_group['last_nrb_index'] = idx
             matched_group['triggers'].append(trigger)
             
-            # Recalculate average level
             all_levels = [t.get('range_high') for t in matched_group['triggers']]
             matched_group['level'] = sum(all_levels) / len(all_levels)
-            
             print(f"[NRB GROUPING] NRB #{nrb_id} → Group #{matched_group['id']} (Avg: {matched_group['level']:.2f})")
-        
         else:
-            # Create new group
             new_group = {
                 'id': group_id,
                 'level': range_high,
@@ -443,7 +531,6 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
     
     all_groups = closed_groups + active_groups
     
-    # Assign metadata
     for group in all_groups:
         for trigger in group['triggers']:
             trigger['nrb_group_id'] = group['id']
