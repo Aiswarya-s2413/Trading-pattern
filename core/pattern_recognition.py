@@ -37,6 +37,10 @@ NRB_LEVEL_TOLERANCE_PCT = 0.05
 # Tolerance for identifying "Near Touch" zones (10%)
 NEAR_TOUCH_TOLERANCE_PCT = 0.10
 
+# 🆕 Maximum allowed gap (in days) between touches to maintain the "Historical Line"
+# If the gap > 365 days, the line stops extending backwards.
+MAX_HISTORY_GAP_DAYS = 365
+
 
 def get_pattern_triggers(
     scrip: str,
@@ -100,7 +104,8 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
-            # 🆕 Step 6: Extend Group Line (Checking for Violations)
+            # 🆕 Step 6: Extend Group Line BACKWARDS (Ends at NRB)
+            # Now includes Gap Check
             triggers = _extend_group_lifespan_to_history(base_queryset, triggers, 'high', tolerance=NRB_LEVEL_TOLERANCE_PCT)
 
             # Step 7: Identify portions of graph close to the Group Level
@@ -186,7 +191,7 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
-            # 🆕 Step 6: Extend Group Line (Checking for Violations)
+            # 🆕 Step 6: Extend Group Line BACKWARDS (Ends at NRB)
             triggers = _extend_group_lifespan_to_history(param_qs, triggers, series_field, tolerance=NRB_LEVEL_TOLERANCE_PCT)
 
             # Step 7: Identify portions of graph close to the Group Level
@@ -226,8 +231,10 @@ def get_weekly_queryset(base_queryset):
 
 def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance=0.05):
     """
-    🆕 UPDATED: Extends the start and end times of an NRB group to cover historical values.
-    CRITICAL: It stops extending if the price goes ABOVE the line (violation).
+    🆕 UPDATED: Extends the start time BACKWARDS to find historical resistance.
+    Ensures the line ALWAYS ends exactly at the last NRB (no forward extension).
+    
+    CRITICAL UPDATE: Stops extending if a gap between touches exceeds MAX_HISTORY_GAP_DAYS.
     """
     if not triggers:
         return triggers
@@ -250,15 +257,10 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
         return triggers
 
     # 2. Get data efficiently
-    # We need 'high' to check for violations if value_field is 'high' or 'close'
-    # For parameters, value_field is the single value.
     if value_field == 'high':
         data_points = list(daily_qs.values('trade_date', 'high').order_by('trade_date'))
         val_key = 'high'
     elif value_field == 'close':
-        # Even if scanning 'close', we check 'high' for violation usually, 
-        # but to keep it generic for parameters, we stick to the field requested or check 'high' if available.
-        # For simplicity here, we use the passed value_field for both touch and violation.
         data_points = list(daily_qs.values('trade_date', value_field).order_by('trade_date'))
         val_key = value_field
     else:
@@ -275,22 +277,21 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
             ts = int(datetime.combine(d['trade_date'], datetime.min.time()).timestamp())
             processed_data.append({'ts': ts, 'val': float(val)})
 
-    # 3. Extend with Violation Check
+    # Max gap in seconds (e.g. 365 days)
+    MAX_GAP_SECONDS = MAX_HISTORY_GAP_DAYS * 24 * 60 * 60
+
+    # 3. Extend Backwards Only
     for gid, group in groups.items():
         level = group['level']
         upper = level * (1 + tolerance)
         lower = level * (1 - tolerance)
         
         current_start_ts = group['start_ts']
-        current_end_ts = group['end_ts']
-        
         final_start_ts = current_start_ts
-        final_end_ts = current_end_ts
+        last_valid_touch_ts = current_start_ts # Keep track of the last time we saw the price at this level
         
         # --- Extend Left (Backwards) ---
-        # Find index of current start
         start_idx = -1
-        # Optimization: Binary search is better, but simple loop is safer for now
         for i, p in enumerate(processed_data):
             if p['ts'] >= current_start_ts:
                 start_idx = i
@@ -298,46 +299,36 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
         
         if start_idx == -1: start_idx = len(processed_data) - 1
 
-        # Walk backwards
         if start_idx > 0:
             for i in range(start_idx - 1, -1, -1):
                 p = processed_data[i]
                 
                 # Check for VIOLATION (Price above line)
                 if p['val'] > upper:
-                    # Violation found, STOP extending left
+                    # Violation found, STOP extending
                     break
                 
                 # Check for VALID TOUCH (Price on line)
                 if lower <= p['val'] <= upper:
+                    # 🆕 Check Gap: Is this touch too far from the last one?
+                    gap = last_valid_touch_ts - p['ts']
+                    if gap > MAX_GAP_SECONDS:
+                        # Gap too large, stop here (don't include this touch or anything before it)
+                        break
+                    
+                    # Valid touch and within gap limit
                     final_start_ts = p['ts']
+                    last_valid_touch_ts = p['ts'] # Reset gap tracker
                 
-                # If price is below lower (gap), we continue walking
-                # hoping to find another touch earlier.
+                # If price is below lower (gap), continue walking left...
+                # But we check the gap distance relative to the *last valid touch* we found.
 
-        # --- Extend Right (Forwards) ---
-        end_idx = -1
-        for i, p in enumerate(processed_data):
-            if p['ts'] >= current_end_ts:
-                end_idx = i
-                break
+        # --- No Forward Extension ---
         
-        if end_idx != -1:
-            for i in range(end_idx + 1, len(processed_data)):
-                p = processed_data[i]
-                
-                # Check for VIOLATION
-                if p['val'] > upper:
-                    break
-                
-                # Check for VALID TOUCH
-                if lower <= p['val'] <= upper:
-                    final_end_ts = p['ts']
-
         # Apply updates
         for t in group['triggers']:
             t['group_start_time'] = final_start_ts
-            t['group_end_time'] = final_end_ts
+            # End time remains unchanged
 
     return triggers
 
