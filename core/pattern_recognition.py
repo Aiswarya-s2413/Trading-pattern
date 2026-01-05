@@ -37,9 +37,8 @@ NRB_LEVEL_TOLERANCE_PCT = 0.05
 # Tolerance for identifying "Near Touch" zones (10%)
 NEAR_TOUCH_TOLERANCE_PCT = 0.10
 
-# 🆕 Maximum allowed gap (in days) between touches to maintain the "Historical Line"
-# If the gap > 365 days, the line stops extending backwards.
-MAX_HISTORY_GAP_DAYS = 365
+# Maximum allowed gap (in days) between touches to maintain the "Historical Line"
+MAX_HISTORY_GAP_DAYS = 8000
 
 
 def get_pattern_triggers(
@@ -50,6 +49,7 @@ def get_pattern_triggers(
     weeks: int = 20,
     series: str | None = None,
     cooldown_weeks: int = DEFAULT_COOLDOWN_WEEKS,
+    dip_threshold_pct: float = 0.20, # 🆕 Added Parameter (Default 20%)
 ):
     """
     Main entry to compute pattern triggers for a given symbol and pattern type.
@@ -78,6 +78,11 @@ def get_pattern_triggers(
             if not weekly_data:
                 return []
 
+            # 1. Get All-Time High/Low for Deep Dip calculation
+            stats = base_queryset.aggregate(min_val=Min('low'), max_val=Max('high'))
+            global_min = float(stats['min_val']) if stats['min_val'] else 0
+            global_max = float(stats['max_val']) if stats['max_val'] else 0
+
             # Step 1: Detect NRB breakouts FIRST
             triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             triggers = _attach_daily_breakout_times_price(base_queryset, triggers)
@@ -104,9 +109,16 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
-            # 🆕 Step 6: Extend Group Line BACKWARDS (Ends at NRB)
-            # Now includes Gap Check
-            triggers = _extend_group_lifespan_to_history(base_queryset, triggers, 'high', tolerance=NRB_LEVEL_TOLERANCE_PCT)
+            # 🆕 Step 6: Extend Group Line & Check Deep Dip (using dynamic threshold)
+            triggers = _extend_group_lifespan_to_history(
+                base_queryset, 
+                triggers, 
+                'high', 
+                tolerance=NRB_LEVEL_TOLERANCE_PCT,
+                global_min=global_min,
+                global_max=global_max,
+                dip_threshold_pct=dip_threshold_pct # 🆕 Passed Here
+            )
 
             # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(base_queryset, triggers, 'close')
@@ -162,6 +174,11 @@ def get_pattern_triggers(
             if not weekly_data:
                 return []
 
+            # 1. Get All-Time High/Low for Deep Dip calculation
+            stats = param_qs.aggregate(min_val=Min(series_field), max_val=Max(series_field))
+            global_min = float(stats['min_val']) if stats['min_val'] else 0
+            global_max = float(stats['max_val']) if stats['max_val'] else 0
+
             # Step 1: Detect NRB breakouts FIRST
             triggers = _detect_narrow_range_break_rolling(weekly_data, nr_weeks, cooldown_weeks)
             
@@ -191,8 +208,16 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
-            # 🆕 Step 6: Extend Group Line BACKWARDS (Ends at NRB)
-            triggers = _extend_group_lifespan_to_history(param_qs, triggers, series_field, tolerance=NRB_LEVEL_TOLERANCE_PCT)
+            # 🆕 Step 6: Extend Group Line & Check Deep Dip (using dynamic threshold)
+            triggers = _extend_group_lifespan_to_history(
+                param_qs, 
+                triggers, 
+                series_field, 
+                tolerance=NRB_LEVEL_TOLERANCE_PCT,
+                global_min=global_min,
+                global_max=global_max,
+                dip_threshold_pct=dip_threshold_pct # 🆕 Passed Here
+            )
 
             # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(param_qs, triggers, series_field)
@@ -229,12 +254,13 @@ def get_weekly_queryset(base_queryset):
     )
 
 
-def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance=0.05):
+# 🆕 Updated Signature to accept dip_threshold_pct
+def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance=0.05, global_min=0, global_max=0, dip_threshold_pct=0.20):
     """
-    🆕 UPDATED: Extends the start time BACKWARDS to find historical resistance.
-    Ensures the line ALWAYS ends exactly at the last NRB (no forward extension).
-    
-    CRITICAL UPDATE: Stops extending if a gap between touches exceeds MAX_HISTORY_GAP_DAYS.
+    🆕 UPDATED: 
+    1. Extends start time BACKWARDS (History Check).
+    2. Stops if Gap > MAX_HISTORY_GAP_DAYS.
+    3. CHECKS DEEP DIP based on 'dip_threshold_pct': If dip found, REMOVES GROUP ID (Line gone) but KEEPS TRIGGER (Arrow stays).
     """
     if not triggers:
         return triggers
@@ -257,16 +283,9 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
         return triggers
 
     # 2. Get data efficiently
-    if value_field == 'high':
-        data_points = list(daily_qs.values('trade_date', 'high').order_by('trade_date'))
-        val_key = 'high'
-    elif value_field == 'close':
-        data_points = list(daily_qs.values('trade_date', value_field).order_by('trade_date'))
-        val_key = value_field
-    else:
-        data_points = list(daily_qs.values('trade_date', value_field).order_by('trade_date'))
-        val_key = value_field
-
+    val_key = 'high' if value_field == 'high' else value_field
+    data_points = list(daily_qs.values('trade_date', val_key).order_by('trade_date'))
+    
     if not data_points:
         return triggers
         
@@ -277,18 +296,24 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
             ts = int(datetime.combine(d['trade_date'], datetime.min.time()).timestamp())
             processed_data.append({'ts': ts, 'val': float(val)})
 
-    # Max gap in seconds (e.g. 365 days)
+    # Max gap in seconds
     MAX_GAP_SECONDS = MAX_HISTORY_GAP_DAYS * 24 * 60 * 60
+    
+    # 🆕 DYNAMIC Dip Calculation
+    chart_height = global_max - global_min
+    dip_threshold_val = chart_height * dip_threshold_pct # Using passed percentage
 
-    # 3. Extend Backwards Only
+    # 3. Extend Backwards & Check Deep Dips
     for gid, group in groups.items():
         level = group['level']
         upper = level * (1 + tolerance)
         lower = level * (1 - tolerance)
         
+        death_line = level - dip_threshold_val
+        
         current_start_ts = group['start_ts']
         final_start_ts = current_start_ts
-        last_valid_touch_ts = current_start_ts # Keep track of the last time we saw the price at this level
+        last_valid_touch_ts = current_start_ts 
         
         # --- Extend Left (Backwards) ---
         start_idx = -1
@@ -302,33 +327,52 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
         if start_idx > 0:
             for i in range(start_idx - 1, -1, -1):
                 p = processed_data[i]
-                
-                # Check for VIOLATION (Price above line)
-                if p['val'] > upper:
-                    # Violation found, STOP extending
-                    break
-                
-                # Check for VALID TOUCH (Price on line)
-                if lower <= p['val'] <= upper:
-                    # 🆕 Check Gap: Is this touch too far from the last one?
-                    gap = last_valid_touch_ts - p['ts']
-                    if gap > MAX_GAP_SECONDS:
-                        # Gap too large, stop here (don't include this touch or anything before it)
-                        break
-                    
-                    # Valid touch and within gap limit
-                    final_start_ts = p['ts']
-                    last_valid_touch_ts = p['ts'] # Reset gap tracker
-                
-                # If price is below lower (gap), continue walking left...
-                # But we check the gap distance relative to the *last valid touch* we found.
+                val = p['val']
 
-        # --- No Forward Extension ---
+                if val > upper: break
+                
+                if lower <= val <= upper:
+                    gap = last_valid_touch_ts - p['ts']
+                    if gap > MAX_GAP_SECONDS: break
+                    
+                    final_start_ts = p['ts']
+                    last_valid_touch_ts = p['ts']
         
-        # Apply updates
-        for t in group['triggers']:
-            t['group_start_time'] = final_start_ts
-            # End time remains unchanged
+        # --- 🆕 DEEP DIP CHECK ---
+        group_end_ts = group['end_ts']
+        is_invalid_deep_dip = False
+
+        scan_start_idx = -1
+        scan_end_idx = -1
+        
+        for i, p in enumerate(processed_data):
+            if scan_start_idx == -1 and p['ts'] >= final_start_ts:
+                scan_start_idx = i
+            if p['ts'] <= group_end_ts:
+                scan_end_idx = i
+            else:
+                break 
+        
+        if scan_start_idx != -1 and scan_end_idx != -1:
+            for i in range(scan_start_idx, scan_end_idx + 1):
+                val = processed_data[i]['val']
+                if val < death_line:
+                    is_invalid_deep_dip = True
+                    break
+        
+        if is_invalid_deep_dip:
+            # 🟢 DISSOLVE THE GROUP (Line disappears)
+            # BUT KEEP THE TRIGGER (Arrow stays)
+            for t in group['triggers']:
+                t['nrb_group_id'] = None
+                t['group_start_time'] = None
+                t['group_end_time'] = None
+                t['group_level'] = None
+                t['group_nrb_count'] = None
+        else:
+            # Valid group: Update the start time
+            for t in group['triggers']:
+                t['group_start_time'] = final_start_ts
 
     return triggers
 

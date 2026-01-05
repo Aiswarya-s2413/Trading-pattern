@@ -15,7 +15,7 @@ from core.pattern_recognition import (
     DEFAULT_COOLDOWN_WEEKS,
     CONSOLIDATION_BUFFER_PCT,
     MIN_CONSOLIDATION_DURATION_WEEKS,
-    NEAR_TOUCH_TOLERANCE_PCT, # 🆕 Added Import
+    NEAR_TOUCH_TOLERANCE_PCT,
 )
 
 from .serializers import SymbolListItemSerializer
@@ -108,6 +108,12 @@ class PatternScanView(APIView):
             series = series_param.strip().lower() if series_param else None
             cooldown_weeks_param = request.query_params.get("cooldown_weeks")
             cooldown_weeks = int(cooldown_weeks_param) if cooldown_weeks_param else DEFAULT_COOLDOWN_WEEKS
+            
+            # 🆕 READ DIP THRESHOLD (Default 20)
+            dip_param = request.query_params.get("dip_threshold")
+            dip_threshold_val = float(dip_param) if dip_param else 20.0
+            # Convert to decimal percentage (20 -> 0.20)
+            dip_threshold_pct = dip_threshold_val / 100.0
 
             if not scrip or not pattern:
                 return Response(
@@ -123,6 +129,7 @@ class PatternScanView(APIView):
         total_rows = EodPrice.objects.filter(symbol__symbol=scrip).count()
         ema_rows = Parameter.objects.filter(symbol__symbol=scrip, ema50__isnull=False).count()
 
+        # 🆕 PASS DIP PERCENTAGE TO FUNCTION
         trigger_markers = get_pattern_triggers(
             scrip=scrip,
             pattern=pattern,
@@ -131,6 +138,7 @@ class PatternScanView(APIView):
             weeks=weeks,
             series=series,
             cooldown_weeks=cooldown_weeks,
+            dip_threshold_pct=dip_threshold_pct 
         )
 
         ohlcv_qs = EodPrice.objects.filter(symbol__symbol=scrip).order_by("trade_date")
@@ -213,22 +221,16 @@ class PatternScanView(APIView):
 
         consolidation_groups = list(zones_by_id.values())
 
-        # -------------------------------------------------------------
-        # 🆕 START: Build Value Lookup for Success Rate Calculation
-        # -------------------------------------------------------------
+        # Build Value Lookup for Success Rate Calculation
         value_lookup = {}
-        # If series is present, use series data for success calculation
         if series and series_data:
             for point in series_data:
                 value_lookup[point['time']] = point['value']
-        # Otherwise use price (close) data
         else:
             for candle in ohlcv_data:
                 value_lookup[candle['time']] = candle['close']
         
-        # Sorted timestamps for efficient future value finding
         sorted_timestamps = sorted(value_lookup.keys())
-        # -------------------------------------------------------------
 
         nrb_groups_by_id = {}
         if trigger_markers:
@@ -236,7 +238,6 @@ class PatternScanView(APIView):
                 group_id = marker.get("nrb_group_id")
                 if group_id and group_id not in nrb_groups_by_id:
                     
-                    # Calculate duration in weeks
                     g_start = marker.get("group_start_time")
                     g_end = marker.get("group_end_time")
                     duration_weeks = 0.0
@@ -244,30 +245,23 @@ class PatternScanView(APIView):
                     if g_start and g_end:
                         duration_weeks = (g_end - g_start) / 604800.0
 
-                    # -------------------------------------------------------------
-                    # 🆕 START: Success Rate Calculation for Groups
-                    # -------------------------------------------------------------
                     success_rate_3m = None
                     success_rate_6m = None
                     success_rate_12m = None
 
                     if g_end and value_lookup:
                         end_val = value_lookup.get(g_end)
-                        
                         if end_val is not None and end_val != 0:
                             end_dt = datetime.fromtimestamp(g_end)
                             
                             def get_future_pct_change(days_offset):
                                 target_dt = end_dt + timedelta(days=days_offset)
                                 target_ts = target_dt.timestamp()
-                                
-                                # Find first available timestamp >= target_ts
                                 future_val = None
                                 for ts in sorted_timestamps:
                                     if ts >= target_ts:
                                         future_val = value_lookup[ts]
                                         break
-                                
                                 if future_val is not None:
                                     return round(((future_val - end_val) / end_val) * 100, 2)
                                 return None
@@ -275,7 +269,6 @@ class PatternScanView(APIView):
                             success_rate_3m = get_future_pct_change(90)
                             success_rate_6m = get_future_pct_change(180)
                             success_rate_12m = get_future_pct_change(365)
-                    # -------------------------------------------------------------
 
                     nrb_groups_by_id[group_id] = {
                         "group_id": group_id,
@@ -288,11 +281,9 @@ class PatternScanView(APIView):
                         "success_rate_6m": success_rate_6m,
                         "success_rate_12m": success_rate_12m,
                         "nrb_ids": [],
-                        "near_touches": marker.get("near_touches", []), # Attach near touches
+                        "near_touches": marker.get("near_touches", []),
                     }
                 
-                # If we encounter the trigger that carries the touches (usually the first one processed for the group),
-                # update the group.
                 if group_id and marker.get("near_touches"):
                      nrb_groups_by_id[group_id]["near_touches"] = marker.get("near_touches")
 
@@ -377,7 +368,8 @@ class PatternScanView(APIView):
                 "series_data_points": len(series_data),
                 "consolidation_zones_count": len(consolidation_groups),
                 "nrb_groups_count": len(nrb_groups),
-                "near_touch_tolerance_pct": NEAR_TOUCH_TOLERANCE_PCT, # 🆕 Added to debug
+                "near_touch_tolerance_pct": NEAR_TOUCH_TOLERANCE_PCT,
+                "dip_threshold_val": dip_threshold_val, # 🆕 Add to debug
             },
         }
 
