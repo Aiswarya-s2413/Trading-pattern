@@ -140,6 +140,7 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5174",
     "https://trading.aiswaryasathyan.space",
+    "https://trading-pattern-frontend.vercel.app",
 ]
 
 
