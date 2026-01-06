@@ -6,6 +6,7 @@ from rest_framework import status
 from django.db.models import Q, Max
 from django.utils.timezone import now
 from collections import defaultdict
+from core.services import recommend_dip_strategy
 
 from marketdata.models import Symbol, EodPrice, Parameter, Index, IndexPrice
 from core.pattern_recognition import (
@@ -444,3 +445,19 @@ class Week52HighView(APIView):
             return Response({"scrip": scrip, "52week_high": None, "message": "No price data found for the past 52 weeks."}, status=status.HTTP_200_OK)
 
         return Response({"scrip": scrip, "52week_high": float(week52_high), "cutoff_date": cutoff_date.isoformat()}, status=status.HTTP_200_OK)
+    
+class DipRecommendationView(APIView):
+    """
+    Endpoint: /api/analyze-dip/<symbol>/
+    Description: Calls the LLM service in 'core' to get a calculated dip percentage.
+    """
+    def get(self, request, symbol):
+        # 1. Call the service located in core/services.py
+        result = recommend_dip_strategy(symbol)
+        
+        # 2. Handle errors (e.g., symbol not found or empty data)
+        if "error" in result:
+            return Response(result, status=status.HTTP_400_BAD_REQUEST)
+            
+        # 3. Return the JSON recommendation
+        return Response(result, status=status.HTTP_200_OK)
