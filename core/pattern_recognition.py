@@ -1037,3 +1037,4 @@ def _detect_bowl_pattern(queryset):
         pattern_id += 1
 
     return result
+
