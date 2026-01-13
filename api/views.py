@@ -339,6 +339,7 @@ class PatternScanView(APIView):
                 "group_start_time": row.get("group_start_time"),
                 "group_end_time": row.get("group_end_time"),
                 "group_nrb_count": row.get("group_nrb_count"),
+                "whipsaws": row.get("whipsaws", []), # 🆕 ADDED WHIPSAWS HERE
             })
 
         total_consolidation_duration_weeks = sum(z.get("duration_weeks", 0) for z in consolidation_groups) if consolidation_groups else 0

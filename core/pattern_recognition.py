@@ -123,6 +123,9 @@ def get_pattern_triggers(
             # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(base_queryset, triggers, 'close')
 
+            # 🆕 Step 8: Detect Post-Breakout Whipsaws
+            triggers = _detect_post_breakout_whipsaws(base_queryset, triggers, value_field='close')
+
             return triggers
 
         # CASE 2: PARAMETER-BASED SERIES
@@ -221,6 +224,9 @@ def get_pattern_triggers(
 
             # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(param_qs, triggers, series_field)
+
+            # 🆕 Step 8: Detect Post-Breakout Whipsaws
+            triggers = _detect_post_breakout_whipsaws(param_qs, triggers, value_field=series_field)
 
             return triggers
 
@@ -1038,3 +1044,104 @@ def _detect_bowl_pattern(queryset):
 
     return result
 
+# 🆕 Whipsaw Detection Function
+def _detect_post_breakout_whipsaws(queryset, triggers, value_field='close'):
+    """
+    Detects Level 1 (-10%), Level 2 (-15%), and Level 3 (-20%) whipsaws 
+    occurring after the breakout, measured from the *highest peak* reached post-breakout.
+    """
+    if not triggers:
+        return triggers
+
+    # 1. Fetch all relevant daily data efficiently
+    # We need data starting from the earliest breakout trigger
+    earliest_ts = min(t['time'] for t in triggers)
+    start_date = datetime.fromtimestamp(earliest_ts).date()
+
+    if value_field == 'close':
+        data_points = list(queryset.filter(trade_date__gte=start_date).values('trade_date', 'close').order_by('trade_date'))
+    else:
+        data_points = list(queryset.filter(trade_date__gte=start_date).values('trade_date', value_field).order_by('trade_date'))
+
+    if not data_points:
+        return triggers
+
+    # Convert to a list of dicts with timestamps for fast iteration
+    processed_data = []
+    for d in data_points:
+        val = d.get('close') if value_field == 'close' else d.get(value_field)
+        if val is not None:
+            ts = int(datetime.combine(d['trade_date'], datetime.min.time()).timestamp())
+            processed_data.append({'ts': ts, 'val': float(val)})
+
+    # 2. Iterate through each trigger to find whipsaws
+    for trigger in triggers:
+        breakout_ts = trigger['time']
+        trigger['whipsaws'] = []
+        
+        # Find index in processed_data corresponding to breakout time
+        # (This avoids re-querying DB for every trigger)
+        start_idx = -1
+        for i, p in enumerate(processed_data):
+            if p['ts'] >= breakout_ts:
+                start_idx = i
+                break
+        
+        if start_idx == -1:
+            continue
+
+        # Whipsaw Logic
+        highest_peak = -1.0
+        levels_triggered = set() # To ensure we mark the FIRST time a level is breached
+        
+        # We scan forward. In a real scenario, we might want to stop scanning if another 
+        # strong breakout occurs, but per requirements, we track the move *after* this specific breakout.
+        # We'll limit the scan to a reasonable horizon (e.g. 1 year) or until data ends.
+        MAX_SCAN_DAYS = 365 
+        breakout_end_ts = breakout_ts + (MAX_SCAN_DAYS * 86400)
+
+        for i in range(start_idx, len(processed_data)):
+            point = processed_data[i]
+            
+            if point['ts'] > breakout_end_ts:
+                break
+
+            current_val = point['val']
+
+            # Update Peak
+            if current_val > highest_peak:
+                highest_peak = current_val
+            
+            # Calculate Drawdown from Peak
+            if highest_peak > 0:
+                drawdown_pct = (highest_peak - current_val) / highest_peak
+                
+                # Check Levels (10%, 15%, 20%)
+                # We record the EVENT when it *crosses* the threshold for the first time
+                
+                detected_level = None
+                if drawdown_pct >= 0.20:
+                    if 3 not in levels_triggered: detected_level = 3
+                elif drawdown_pct >= 0.15:
+                    if 2 not in levels_triggered: detected_level = 2
+                elif drawdown_pct >= 0.10:
+                    if 1 not in levels_triggered: detected_level = 1
+                
+                if detected_level:
+                    levels_triggered.add(detected_level)
+                    # If we hit Level 3 directly (e.g. massive gap down), we also implicitly hit 1 and 2
+                    if detected_level == 3:
+                        levels_triggered.add(1)
+                        levels_triggered.add(2)
+                    elif detected_level == 2:
+                        levels_triggered.add(1)
+
+                    trigger['whipsaws'].append({
+                        'level': detected_level,
+                        'time': point['ts'],
+                        'price': current_val,
+                        'peak_price': highest_peak,
+                        'drawdown_pct': round(drawdown_pct * 100, 2)
+                    })
+
+    return triggers
