@@ -110,11 +110,17 @@ class PatternScanView(APIView):
             cooldown_weeks_param = request.query_params.get("cooldown_weeks")
             cooldown_weeks = int(cooldown_weeks_param) if cooldown_weeks_param else DEFAULT_COOLDOWN_WEEKS
             
-            # 🆕 READ DIP THRESHOLD (Default 20)
+            # READ DIP THRESHOLD (Default 20)
             dip_param = request.query_params.get("dip_threshold")
             dip_threshold_val = float(dip_param) if dip_param else 20.0
             # Convert to decimal percentage (20 -> 0.20)
             dip_threshold_pct = dip_threshold_val / 100.0
+
+            # 🆕 READ NEW D1/D2 WHIPSAW PARAMS
+            d1_param = request.query_params.get("whipsaw_d1")
+            d2_param = request.query_params.get("whipsaw_d2")
+            whipsaw_d1 = int(d1_param) if d1_param else None
+            whipsaw_d2 = int(d2_param) if d2_param else None
 
             if not scrip or not pattern:
                 return Response(
@@ -130,7 +136,7 @@ class PatternScanView(APIView):
         total_rows = EodPrice.objects.filter(symbol__symbol=scrip).count()
         ema_rows = Parameter.objects.filter(symbol__symbol=scrip, ema50__isnull=False).count()
 
-        # 🆕 PASS DIP PERCENTAGE TO FUNCTION
+        # 🆕 PASS D1/D2 TO FUNCTION
         trigger_markers = get_pattern_triggers(
             scrip=scrip,
             pattern=pattern,
@@ -139,7 +145,9 @@ class PatternScanView(APIView):
             weeks=weeks,
             series=series,
             cooldown_weeks=cooldown_weeks,
-            dip_threshold_pct=dip_threshold_pct 
+            dip_threshold_pct=dip_threshold_pct,
+            whipsaw_d1=whipsaw_d1, # Passed to core logic
+            whipsaw_d2=whipsaw_d2  # Passed to core logic
         )
 
         ohlcv_qs = EodPrice.objects.filter(symbol__symbol=scrip).order_by("trade_date")
@@ -339,7 +347,7 @@ class PatternScanView(APIView):
                 "group_start_time": row.get("group_start_time"),
                 "group_end_time": row.get("group_end_time"),
                 "group_nrb_count": row.get("group_nrb_count"),
-                "whipsaws": row.get("whipsaws", []), # 🆕 ADDED WHIPSAWS HERE
+                "whipsaws": row.get("whipsaws", []), # Added Whipsaws
             })
 
         total_consolidation_duration_weeks = sum(z.get("duration_weeks", 0) for z in consolidation_groups) if consolidation_groups else 0
@@ -371,7 +379,9 @@ class PatternScanView(APIView):
                 "consolidation_zones_count": len(consolidation_groups),
                 "nrb_groups_count": len(nrb_groups),
                 "near_touch_tolerance_pct": NEAR_TOUCH_TOLERANCE_PCT,
-                "dip_threshold_val": dip_threshold_val, # 🆕 Add to debug
+                "dip_threshold_val": dip_threshold_val,
+                "whipsaw_d1": whipsaw_d1, # 🆕 Debug Info
+                "whipsaw_d2": whipsaw_d2, # 🆕 Debug Info
             },
         }
 

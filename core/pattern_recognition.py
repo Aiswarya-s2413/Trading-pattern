@@ -49,7 +49,9 @@ def get_pattern_triggers(
     weeks: int = 20,
     series: str | None = None,
     cooldown_weeks: int = DEFAULT_COOLDOWN_WEEKS,
-    dip_threshold_pct: float = 0.20, # 🆕 Added Parameter (Default 20%)
+    dip_threshold_pct: float = 0.20,
+    whipsaw_d1: int | None = None,
+    whipsaw_d2: int | None = None,
 ):
     """
     Main entry to compute pattern triggers for a given symbol and pattern type.
@@ -109,7 +111,7 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
-            # 🆕 Step 6: Extend Group Line & Check Deep Dip (using dynamic threshold)
+            # Step 6: Extend Group Line & Check Deep Dip
             triggers = _extend_group_lifespan_to_history(
                 base_queryset, 
                 triggers, 
@@ -117,14 +119,20 @@ def get_pattern_triggers(
                 tolerance=NRB_LEVEL_TOLERANCE_PCT,
                 global_min=global_min,
                 global_max=global_max,
-                dip_threshold_pct=dip_threshold_pct # 🆕 Passed Here
+                dip_threshold_pct=dip_threshold_pct
             )
 
             # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(base_queryset, triggers, 'close')
 
-            # 🆕 Step 8: Detect Post-Breakout Whipsaws
-            triggers = _detect_post_breakout_whipsaws(base_queryset, triggers, value_field='close')
+            # 🆕 Step 8: Detect Post-Breakout Whipsaws (PRICE BASED)
+            triggers = _detect_post_breakout_whipsaws(
+                base_queryset, 
+                triggers, 
+                value_field='close',
+                whipsaw_d1=whipsaw_d1,
+                whipsaw_d2=whipsaw_d2
+            )
 
             return triggers
 
@@ -211,7 +219,7 @@ def get_pattern_triggers(
             # Step 5: Assign each NRB to its consolidation zone
             triggers = _assign_nrbs_to_zones(triggers, consolidation_zones)
 
-            # 🆕 Step 6: Extend Group Line & Check Deep Dip (using dynamic threshold)
+            # Step 6: Extend Group Line & Check Deep Dip
             triggers = _extend_group_lifespan_to_history(
                 param_qs, 
                 triggers, 
@@ -219,14 +227,20 @@ def get_pattern_triggers(
                 tolerance=NRB_LEVEL_TOLERANCE_PCT,
                 global_min=global_min,
                 global_max=global_max,
-                dip_threshold_pct=dip_threshold_pct # 🆕 Passed Here
+                dip_threshold_pct=dip_threshold_pct
             )
 
             # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(param_qs, triggers, series_field)
 
-            # 🆕 Step 8: Detect Post-Breakout Whipsaws
-            triggers = _detect_post_breakout_whipsaws(param_qs, triggers, value_field=series_field)
+            # 🆕 Step 8: Detect Post-Breakout Whipsaws (PARAMETER)
+            triggers = _detect_post_breakout_whipsaws(
+                param_qs, 
+                triggers, 
+                value_field=series_field,
+                whipsaw_d1=whipsaw_d1,
+                whipsaw_d2=whipsaw_d2
+            )
 
             return triggers
 
@@ -260,13 +274,11 @@ def get_weekly_queryset(base_queryset):
     )
 
 
-# 🆕 Updated Signature to accept dip_threshold_pct
 def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance=0.05, global_min=0, global_max=0, dip_threshold_pct=0.20):
     """
-    🆕 UPDATED: 
     1. Extends start time BACKWARDS (History Check).
     2. Stops if Gap > MAX_HISTORY_GAP_DAYS.
-    3. CHECKS DEEP DIP based on 'dip_threshold_pct': If dip found, REMOVES GROUP ID (Line gone) but KEEPS TRIGGER (Arrow stays).
+    3. CHECKS DEEP DIP: If dip > dip_threshold_pct found, REMOVES GROUP ID (Line gone) but KEEPS TRIGGER (Arrow stays).
     """
     if not triggers:
         return triggers
@@ -305,9 +317,9 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
     # Max gap in seconds
     MAX_GAP_SECONDS = MAX_HISTORY_GAP_DAYS * 24 * 60 * 60
     
-    # 🆕 DYNAMIC Dip Calculation
+    # DYNAMIC Dip Calculation
     chart_height = global_max - global_min
-    dip_threshold_val = chart_height * dip_threshold_pct # Using passed percentage
+    dip_threshold_val = chart_height * dip_threshold_pct 
 
     # 3. Extend Backwards & Check Deep Dips
     for gid, group in groups.items():
@@ -344,7 +356,7 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
                     final_start_ts = p['ts']
                     last_valid_touch_ts = p['ts']
         
-        # --- 🆕 DEEP DIP CHECK ---
+        # --- DEEP DIP CHECK ---
         group_end_ts = group['end_ts']
         is_invalid_deep_dip = False
 
@@ -367,8 +379,7 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
                     break
         
         if is_invalid_deep_dip:
-            # 🟢 DISSOLVE THE GROUP (Line disappears)
-            # BUT KEEP THE TRIGGER (Arrow stays)
+            # DISSOLVE THE GROUP (Line disappears)
             for t in group['triggers']:
                 t['nrb_group_id'] = None
                 t['group_start_time'] = None
@@ -390,7 +401,6 @@ def _attach_proximity_zones(daily_qs, triggers, value_field, tolerance=NEAR_TOUC
     if not triggers:
         return triggers
 
-    # 1. Identify Groups and their parameters
     groups = {}
     for t in triggers:
         gid = t.get('nrb_group_id')
@@ -441,7 +451,6 @@ def _attach_proximity_zones(daily_qs, triggers, value_field, tolerance=NEAR_TOUC
             is_close = lower_bound <= val <= upper_bound
             
             if is_close:
-                # Calculate deviation percentage (0% = perfect match)
                 diff_pct = abs(val - level) / level * 100
                 
                 if current_touch is None:
@@ -475,7 +484,7 @@ def _attach_proximity_zones(daily_qs, triggers, value_field, tolerance=NEAR_TOUC
 
 def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars=5):
     """
-    Groups NRBs at same price level, checking for intermediate breakouts.
+    Groups NRBs at same price level.
     """
     if not triggers:
         return triggers
@@ -517,7 +526,6 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
         for group in groups_to_close:
             active_groups.remove(group)
             closed_groups.append(group)
-            print(f"[NRB GROUPING] 🔒 Closing Group #{group['id']} (Gap > {max_gap_bars})")
         
         matched_group = None
         
@@ -536,9 +544,6 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
                     if last_time < candle['time'] < current_time:
                         if candle['high'] > violation_threshold:
                             is_violated = True
-                            print(f"[NRB GROUPING] 🚫 Violation found for Group #{group['id']}: "
-                                  f"Price {candle['high']:.2f} > Threshold {violation_threshold:.2f} "
-                                  f"at {datetime.fromtimestamp(candle['time']).date()}")
                             break
                     if candle['time'] >= current_time:
                         break
@@ -555,7 +560,6 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
             
             all_levels = [t.get('range_high') for t in matched_group['triggers']]
             matched_group['level'] = sum(all_levels) / len(all_levels)
-            print(f"[NRB GROUPING] NRB #{nrb_id} → Group #{matched_group['id']} (Avg: {matched_group['level']:.2f})")
         else:
             new_group = {
                 'id': group_id,
@@ -567,7 +571,6 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
                 'triggers': [trigger]
             }
             active_groups.append(new_group)
-            print(f"[NRB GROUPING] NRB #{nrb_id} → New Group #{group_id}")
             group_id += 1
     
     all_groups = closed_groups + active_groups
@@ -585,7 +588,7 @@ def _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=0.05, max_gap_bars
 
 def _calculate_zone_success_rates(queryset, consolidation_zones, series_field='close'):
     """
-    Calculate success rates (3m, 6m, 12m) based on price appreciation.
+    Calculate success rates (3m, 6m, 12m).
     """
     if not consolidation_zones:
         return consolidation_zones
@@ -645,7 +648,7 @@ def _calculate_zone_success_rates(queryset, consolidation_zones, series_field='c
 
 def _find_consolidation_zones_with_nrb(weekly_data, nrb_triggers, series_field='close', buffer_pct=0.35, min_duration=4):
     """
-    Find consolidation zones ending with NRB breakout.
+    Find consolidation zones.
     """
     if not weekly_data or not nrb_triggers:
         return []
@@ -1044,17 +1047,29 @@ def _detect_bowl_pattern(queryset):
 
     return result
 
-# 🆕 Whipsaw Detection Function
-def _detect_post_breakout_whipsaws(queryset, triggers, value_field='close'):
+
+# 🆕 UPDATED: D1/D2 Whipsaw Detection Logic (WITH DEBUG LOGS)
+def _detect_post_breakout_whipsaws(queryset, triggers, value_field='close', whipsaw_d1=None, whipsaw_d2=None):
     """
-    Detects Level 1 (-10%), Level 2 (-15%), and Level 3 (-20%) whipsaws 
-    occurring after the breakout, measured from the *highest peak* reached post-breakout.
+    V-Shape Whipsaw Logic with DEBUG PRINTS
     """
     if not triggers:
         return triggers
 
-    # 1. Fetch all relevant daily data efficiently
-    # We need data starting from the earliest breakout trigger
+    if not whipsaw_d1 or not whipsaw_d2:
+        for t in triggers:
+            t['whipsaws'] = []
+        return triggers
+
+    print(f"\n[WHIPSAW DEBUG] Started for series: {value_field}")
+    print(f"[WHIPSAW DEBUG] D1={whipsaw_d1} weeks, D2={whipsaw_d2} weeks")
+
+    # Convert weeks to seconds for comparison
+    WEEK_SECONDS = 7 * 24 * 60 * 60
+    d1_seconds = whipsaw_d1 * WEEK_SECONDS
+    d2_seconds = whipsaw_d2 * WEEK_SECONDS
+
+    # 1. Fetch data
     earliest_ts = min(t['time'] for t in triggers)
     start_date = datetime.fromtimestamp(earliest_ts).date()
 
@@ -1064,9 +1079,9 @@ def _detect_post_breakout_whipsaws(queryset, triggers, value_field='close'):
         data_points = list(queryset.filter(trade_date__gte=start_date).values('trade_date', value_field).order_by('trade_date'))
 
     if not data_points:
+        print("[WHIPSAW DEBUG] No data points found after earliest breakout.")
         return triggers
 
-    # Convert to a list of dicts with timestamps for fast iteration
     processed_data = []
     for d in data_points:
         val = d.get('close') if value_field == 'close' else d.get(value_field)
@@ -1074,74 +1089,90 @@ def _detect_post_breakout_whipsaws(queryset, triggers, value_field='close'):
             ts = int(datetime.combine(d['trade_date'], datetime.min.time()).timestamp())
             processed_data.append({'ts': ts, 'val': float(val)})
 
-    # 2. Iterate through each trigger to find whipsaws
-    for trigger in triggers:
-        breakout_ts = trigger['time']
+    # 2. Iterate triggers
+    for i, trigger in enumerate(triggers):
         trigger['whipsaws'] = []
+        breakout_ts = trigger['time']
         
-        # Find index in processed_data corresponding to breakout time
-        # (This avoids re-querying DB for every trigger)
+        print(f"\n--- Checking Breakout #{i+1} at TS {breakout_ts} ---")
+        
+        # Determine Baseline
         start_idx = -1
-        for i, p in enumerate(processed_data):
+        baseline_val = None
+
+        for idx, p in enumerate(processed_data):
             if p['ts'] >= breakout_ts:
-                start_idx = i
+                baseline_val = p['val']
+                start_idx = idx
                 break
         
-        if start_idx == -1:
+        if start_idx == -1 or baseline_val is None:
+            print("[WHIPSAW DEBUG] Could not find baseline value for breakout time.")
             continue
+            
+        print(f"[WHIPSAW DEBUG] Baseline Value: {baseline_val}")
 
-        # Whipsaw Logic
-        highest_peak = -1.0
-        levels_triggered = set() # To ensure we mark the FIRST time a level is breached
+        # Targets
+        drop_target = baseline_val * 0.90   # -10% Drop
+        recover_target = baseline_val * 1.05 # +5% Recovery
         
-        # We scan forward. In a real scenario, we might want to stop scanning if another 
-        # strong breakout occurs, but per requirements, we track the move *after* this specific breakout.
-        # We'll limit the scan to a reasonable horizon (e.g. 1 year) or until data ends.
-        MAX_SCAN_DAYS = 365 
-        breakout_end_ts = breakout_ts + (MAX_SCAN_DAYS * 86400)
+        print(f"[WHIPSAW DEBUG] Targets -> Drop < {drop_target:.4f} | Recover > {recover_target:.4f}")
 
-        for i in range(start_idx, len(processed_data)):
-            point = processed_data[i]
+        # Time Limit for D1
+        d1_deadline = breakout_ts + d1_seconds
+        
+        # --- PHASE 1: Find the Drop (D1) ---
+        drop_found = False
+        drop_idx = -1
+        drop_ts = 0
+        min_val_found = baseline_val
+        
+        for k in range(start_idx, len(processed_data)):
+            p = processed_data[k]
             
-            if point['ts'] > breakout_end_ts:
+            if p['ts'] > d1_deadline:
+                print(f"[WHIPSAW DEBUG] D1 Timeout. Lowest found: {min_val_found:.4f}")
                 break
-
-            current_val = point['val']
-
-            # Update Peak
-            if current_val > highest_peak:
-                highest_peak = current_val
             
-            # Calculate Drawdown from Peak
-            if highest_peak > 0:
-                drawdown_pct = (highest_peak - current_val) / highest_peak
-                
-                # Check Levels (10%, 15%, 20%)
-                # We record the EVENT when it *crosses* the threshold for the first time
-                
-                detected_level = None
-                if drawdown_pct >= 0.20:
-                    if 3 not in levels_triggered: detected_level = 3
-                elif drawdown_pct >= 0.15:
-                    if 2 not in levels_triggered: detected_level = 2
-                elif drawdown_pct >= 0.10:
-                    if 1 not in levels_triggered: detected_level = 1
-                
-                if detected_level:
-                    levels_triggered.add(detected_level)
-                    # If we hit Level 3 directly (e.g. massive gap down), we also implicitly hit 1 and 2
-                    if detected_level == 3:
-                        levels_triggered.add(1)
-                        levels_triggered.add(2)
-                    elif detected_level == 2:
-                        levels_triggered.add(1)
+            if p['val'] < min_val_found:
+                min_val_found = p['val']
 
+            if p['val'] <= drop_target:
+                drop_found = True
+                drop_idx = k
+                drop_ts = p['ts']
+                print(f"[WHIPSAW DEBUG] ✅ DROP FOUND at TS {drop_ts} | Value: {p['val']:.4f}")
+                break
+        
+        # --- PHASE 2: Find the Recovery (D2) ---
+        if drop_found:
+            d2_deadline = drop_ts + d2_seconds
+            recovery_found = False
+            
+            for k in range(drop_idx + 1, len(processed_data)):
+                p = processed_data[k]
+                
+                if p['ts'] > d2_deadline:
+                    print(f"[WHIPSAW DEBUG] D2 Timeout. Recovery failed.")
+                    break
+                
+                if p['val'] >= recover_target:
+                    # SUCCESS
+                    print(f"[WHIPSAW DEBUG] 🚀 RECOVERY FOUND at TS {p['ts']} | Value: {p['val']:.4f}")
                     trigger['whipsaws'].append({
-                        'level': detected_level,
-                        'time': point['ts'],
-                        'price': current_val,
-                        'peak_price': highest_peak,
-                        'drawdown_pct': round(drawdown_pct * 100, 2)
+                        'level': 4,
+                        'time': p['ts'],
+                        'price': p['val'],
+                        'drop_time': drop_ts,
+                        'drop_price': processed_data[drop_idx]['val'],
+                        'is_v_shape': True
                     })
+                    recovery_found = True
+                    break
+            
+            if not recovery_found:
+                print("[WHIPSAW DEBUG] Drop found, but no recovery within D2.")
+        else:
+            print(f"[WHIPSAW DEBUG] No drop found within D1. Lowest was {min_val_found:.4f}")
 
     return triggers
