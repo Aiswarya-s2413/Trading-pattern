@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 
 from django.db.models import F, Q, Window, Min, Max, DecimalField
 from django.db.models.functions import TruncWeek
@@ -92,6 +92,9 @@ def get_pattern_triggers(
             # Step 2: Group NRBs at the same level
             triggers = _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=NRB_LEVEL_TOLERANCE_PCT)
             
+            # 🟢 NEW: Ensure ALL triggers have a group_id (even standalone ones)
+            triggers = _ensure_all_triggers_have_group_id(triggers)
+            
             # Step 3: Find consolidation zones that END with these NRBs
             consolidation_zones = _find_consolidation_zones_with_nrb(
                 weekly_data, 
@@ -125,7 +128,7 @@ def get_pattern_triggers(
             # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(base_queryset, triggers, 'close')
 
-            # 🆕 Step 8: Detect Post-Breakout Whipsaws (PRICE BASED)
+            # Step 8: Detect Post-Breakout Whipsaws (PRICE BASED)
             triggers = _detect_post_breakout_whipsaws(
                 base_queryset, 
                 triggers, 
@@ -200,6 +203,9 @@ def get_pattern_triggers(
             # Step 2: Group NRBs at the same level
             triggers = _group_nrbs_by_level(triggers, weekly_data, tolerance_pct=NRB_LEVEL_TOLERANCE_PCT)
             
+            # 🟢 NEW: Ensure ALL triggers have a group_id (even standalone ones)
+            triggers = _ensure_all_triggers_have_group_id(triggers)
+            
             # Step 3: Find consolidation zones that END with these NRBs
             consolidation_zones = _find_consolidation_zones_with_nrb(
                 weekly_data,
@@ -233,7 +239,7 @@ def get_pattern_triggers(
             # Step 7: Identify portions of graph close to the Group Level
             triggers = _attach_proximity_zones(param_qs, triggers, series_field)
 
-            # 🆕 Step 8: Detect Post-Breakout Whipsaws (PARAMETER)
+            # Step 8: Detect Post-Breakout Whipsaws (PARAMETER)
             triggers = _detect_post_breakout_whipsaws(
                 param_qs, 
                 triggers, 
@@ -274,14 +280,54 @@ def get_weekly_queryset(base_queryset):
     )
 
 
+def _ensure_all_triggers_have_group_id(triggers):
+    """
+    🟢 NEW FUNCTION: Ensures EVERY trigger has a group_id.
+    For triggers that don't have one (standalone breakouts), create individual groups.
+    This ensures ALL blue markers will have cyan duration lines displayed.
+    """
+    if not triggers:
+        return triggers
+    
+    # Find the highest existing group_id
+    max_group_id = 0
+    for t in triggers:
+        gid = t.get('nrb_group_id')
+        if gid and gid > max_group_id:
+            max_group_id = gid
+    
+    # Assign new group_ids to any trigger without one
+    next_group_id = max_group_id + 1
+    
+    for t in triggers:
+        if not t.get('nrb_group_id'):
+            # Create a standalone group for this trigger
+            t['nrb_group_id'] = next_group_id
+            t['group_start_time'] = t.get('range_start_time')
+            t['group_end_time'] = t.get('range_end_time')
+            t['group_level'] = t.get('range_high')
+            t['group_nrb_count'] = 1
+            next_group_id += 1
+    
+    print(f"[ENSURE GROUPS] All {len(triggers)} triggers now have group_ids")
+    return triggers
+
+
+# ... (rest of the functions remain exactly the same - I'll include them for completeness)
+
+
 def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance=0.05, global_min=0, global_max=0, dip_threshold_pct=0.20):
     """
     1. Extends start time BACKWARDS (History Check).
     2. Stops if Gap > MAX_HISTORY_GAP_DAYS.
-    3. CHECKS DEEP DIP: If dip > dip_threshold_pct found, REMOVES GROUP ID (Line gone) but KEEPS TRIGGER (Arrow stays).
+    3. CHECKS DEEP DIP: If dip > 50% found, REMOVES GROUP ID (Line gone) but KEEPS TRIGGER (Arrow stays).
+    
+    🟢 MODIFIED: Made dip check MUCH more lenient (50% fixed threshold instead of dynamic)
     """
     if not triggers:
         return triggers
+
+    print(f"\n[EXTEND HISTORY] Starting with {len(triggers)} triggers")
 
     # 1. Map groups
     groups = {}
@@ -300,6 +346,8 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
     if not groups:
         return triggers
 
+    print(f"[EXTEND HISTORY] Processing {len(groups)} groups")
+
     # 2. Get data efficiently
     val_key = 'high' if value_field == 'high' else value_field
     data_points = list(daily_qs.values('trade_date', val_key).order_by('trade_date'))
@@ -317,17 +365,19 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
     # Max gap in seconds
     MAX_GAP_SECONDS = MAX_HISTORY_GAP_DAYS * 24 * 60 * 60
     
-    # DYNAMIC Dip Calculation
-    chart_height = global_max - global_min
-    dip_threshold_val = chart_height * dip_threshold_pct 
+    # 🟢 FIXED DIP THRESHOLD: 50% drop (very severe) instead of dynamic
+    # This ensures only extreme cases remove the cyan line
+    SEVERE_DIP_THRESHOLD = 0.50  # 50% drop
 
     # 3. Extend Backwards & Check Deep Dips
+    groups_removed = 0
     for gid, group in groups.items():
         level = group['level']
         upper = level * (1 + tolerance)
         lower = level * (1 - tolerance)
         
-        death_line = level - dip_threshold_val
+        # 🟢 CHANGED: Fixed 50% threshold
+        death_line = level * (1 - SEVERE_DIP_THRESHOLD)
         
         current_start_ts = group['start_ts']
         final_start_ts = current_start_ts
@@ -356,9 +406,10 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
                     final_start_ts = p['ts']
                     last_valid_touch_ts = p['ts']
         
-        # --- DEEP DIP CHECK ---
+        # --- DEEP DIP CHECK (Now 50% threshold) ---
         group_end_ts = group['end_ts']
         is_invalid_deep_dip = False
+        min_value_in_range = level
 
         scan_start_idx = -1
         scan_end_idx = -1
@@ -374,23 +425,31 @@ def _extend_group_lifespan_to_history(daily_qs, triggers, value_field, tolerance
         if scan_start_idx != -1 and scan_end_idx != -1:
             for i in range(scan_start_idx, scan_end_idx + 1):
                 val = processed_data[i]['val']
+                if val < min_value_in_range:
+                    min_value_in_range = val
                 if val < death_line:
                     is_invalid_deep_dip = True
                     break
         
         if is_invalid_deep_dip:
             # DISSOLVE THE GROUP (Line disappears)
+            drop_pct = ((level - min_value_in_range) / level) * 100
+            print(f"[EXTEND HISTORY] ❌ Group {gid} removed - {drop_pct:.1f}% dip below level {level:.5f}")
             for t in group['triggers']:
                 t['nrb_group_id'] = None
                 t['group_start_time'] = None
                 t['group_end_time'] = None
                 t['group_level'] = None
                 t['group_nrb_count'] = None
+            groups_removed += 1
         else:
             # Valid group: Update the start time
+            extension_weeks = (current_start_ts - final_start_ts) / 604800.0
+            print(f"[EXTEND HISTORY] ✅ Group {gid} extended backwards by {extension_weeks:.1f} weeks")
             for t in group['triggers']:
                 t['group_start_time'] = final_start_ts
 
+    print(f"[EXTEND HISTORY] Complete: {groups_removed} groups removed, {len(groups) - groups_removed} groups kept")
     return triggers
 
 
@@ -1048,7 +1107,6 @@ def _detect_bowl_pattern(queryset):
     return result
 
 
-# 🆕 UPDATED: D1/D2 Whipsaw Detection Logic (WITH DEBUG LOGS)
 def _detect_post_breakout_whipsaws(queryset, triggers, value_field='close', whipsaw_d1=None, whipsaw_d2=None):
     """
     V-Shape Whipsaw Logic with DEBUG PRINTS
