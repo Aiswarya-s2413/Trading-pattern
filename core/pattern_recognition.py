@@ -142,13 +142,15 @@ def get_pattern_triggers(
         # CASE 2: PARAMETER-BASED SERIES
         else:
             PARAM_FIELD_MAP = {
-                "ema21": "ema21",
-                "ema50": "ema50",
-                "ema200": "ema200",
-                "rsc30": "rsc_sensex_ratio",
-                "rsc_sensex": "rsc_sensex_ratio",
-                "rsc_sensex_ratio": "rsc_sensex_ratio",
-            }
+                    "ema21": "ema21",
+                    "ema50": "ema50",
+                    "ema200": "ema200",
+                    "rsc30": "rsc_sensex_ratio",
+                    "rsc_sensex": "rsc_sensex_ratio",
+                    "rsc_sensex_ratio": "rsc_sensex_ratio",
+                    "rsc_nse": "rsc_nse_ratio",
+                    "rsc_nse_ratio": "rsc_nse_ratio",
+                }
 
             series_field = PARAM_FIELD_MAP.get(series_normalized)
             if not series_field:

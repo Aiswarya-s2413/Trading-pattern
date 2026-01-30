@@ -87,7 +87,7 @@ DATABASES = {
         'USER': 'trading_user',
         'PASSWORD': 'trading_password',
         'HOST': 'localhost',
-        'PORT': '5432',
+        'PORT': '5433',
     }
 }
 

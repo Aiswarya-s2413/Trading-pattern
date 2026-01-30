@@ -167,12 +167,13 @@ class PatternScanView(APIView):
         series_data_ema10 = []
         
         valid_series_fields = {
-            "ema21": "ema21",
-            "ema50": "ema50",
-            "ema200": "ema200",
-            "rsc30": "rsc_sensex_ratio",
-            "rsc500": "rsc500",
-        }
+                "ema21": "ema21",
+                "ema50": "ema50",
+                "ema200": "ema200",
+                "rsc30": "rsc_sensex_ratio",
+                "rsc500": "rsc500",
+                "rsc_nse": "rsc_nse_ratio",
+            }
         
         if series in valid_series_fields:
             field_name = valid_series_fields[series]
@@ -193,6 +194,24 @@ class PatternScanView(APIView):
                 series_data_ema10 = [
                     {"time": int(datetime.combine(row.trade_date, datetime.min.time()).timestamp()), "value": float(row.rsc_sensex_ema10)}
                     for row in param_qs if row.rsc_sensex_ema10 is not None
+                ]
+            elif series == "rsc_nse":
+                param_qs = (
+                    Parameter.objects.filter(symbol__symbol=scrip)
+                    .exclude(rsc_nse_ratio__isnull=True)
+                    .order_by("trade_date")
+                )
+                series_data = [
+                    {"time": int(datetime.combine(row.trade_date, datetime.min.time()).timestamp()), "value": float(row.rsc_nse_ratio)}
+                    for row in param_qs if row.rsc_nse_ratio is not None
+                ]
+                series_data_ema5 = [
+                    {"time": int(datetime.combine(row.trade_date, datetime.min.time()).timestamp()), "value": float(row.rsc_nse_ema5)}
+                    for row in param_qs if row.rsc_nse_ema5 is not None
+                ]
+                series_data_ema10 = [
+                    {"time": int(datetime.combine(row.trade_date, datetime.min.time()).timestamp()), "value": float(row.rsc_nse_ema10)}
+                    for row in param_qs if row.rsc_nse_ema10 is not None
                 ]
             else:
                 param_qs = (
@@ -307,6 +326,9 @@ class PatternScanView(APIView):
         if series == "rsc30" and series_data:
             for point in series_data:
                 rsc_lookup[point["time"]] = point["value"]
+        if series == "rsc_nse" and series_data:
+            for point in series_data:
+                rsc_lookup[point["time"]] = point["value"]
 
         markers = []
         for row in trigger_markers:
@@ -317,7 +339,7 @@ class PatternScanView(APIView):
             range_low = row.get("range_low")
             range_high = row.get("range_high")
             
-            if series == "rsc30" and range_low is not None and range_high is not None:
+            if series in ["rsc30", "rsc_nse"] and range_low is not None and range_high is not None:
                 range_start_time = row.get("range_start_time")
                 range_end_time = row.get("range_end_time")
                 if range_start_time and range_end_time:

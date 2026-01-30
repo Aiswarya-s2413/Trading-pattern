@@ -74,6 +74,10 @@ class Parameter(models.Model):
     ema50 = models.DecimalField(max_digits=12, decimal_places=4, null=True)
     ema200 = models.DecimalField(max_digits=12, decimal_places=4, null=True)
 
+    rsc_nse_ratio = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    rsc_nse_ema5 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    rsc_nse_ema10 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+
     class Meta:
         unique_together = ("trade_date", "symbol")
         verbose_name = "Parameter"
