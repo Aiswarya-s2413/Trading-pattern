@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import PatternScanView, PriceHistoryView, SymbolListView, Week52HighView, DipRecommendationView
+from .views import PatternScanView, PriceHistoryView, SymbolListView, Week52HighView, DipRecommendationView, AIPredictionView
 
 urlpatterns = [
     path("pattern-scan/", PatternScanView.as_view(), name="pattern-scan"),
@@ -7,4 +7,5 @@ urlpatterns = [
     path("symbols/", SymbolListView.as_view(), name="symbol-list"),
     path("52week-high/", Week52HighView.as_view(), name="week52-high"),
     path('analyze-dip/<str:symbol>/', DipRecommendationView.as_view(), name='analyze-dip'),
+    path('ai-predictions/', AIPredictionView.as_view(), name='ai-predictions'),
 ]

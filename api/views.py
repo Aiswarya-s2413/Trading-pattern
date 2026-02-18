@@ -22,6 +22,9 @@ from core.pattern_recognition import (
 from .serializers import SymbolListItemSerializer
 from .pagination import SymbolPagination
 from .utils import relevance
+import pandas as pd
+import os
+from django.conf import settings
 
 
 class SymbolListView(APIView):
@@ -494,3 +497,45 @@ class DipRecommendationView(APIView):
             
         # 3. Return the JSON recommendation
         return Response(result, status=status.HTTP_200_OK)
+
+
+class AIPredictionView(APIView):
+    def get(self, request, *args, **kwargs):
+        file_path = os.path.join(settings.BASE_DIR, 'ai_training/backtest_results_2025_FULL.xlsx')
+        
+        if not os.path.exists(file_path):
+             return Response({"error": "Prediction file not found."}, status=status.HTTP_404_NOT_FOUND)
+        
+        try:
+            df = pd.read_excel(file_path)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+        # Get all sectors map
+        symbols = df['Symbol'].unique().tolist()
+        symbol_map = {
+            s.symbol: s.sector.name if s.sector else "Unknown" 
+            for s in Symbol.objects.filter(symbol__in=symbols).select_related('sector')
+        }
+        
+        results = []
+        for _, row in df.iterrows():
+            sym = row['Symbol']
+            # Convert date to string YYYY-MM-DD
+            date_str = str(row['Date'])
+            if ' ' in date_str:
+                date_str = date_str.split(' ')[0]
+                
+            results.append({
+                "symbol": sym,
+                "date": date_str,
+                "sector": symbol_map.get(sym, "Unknown"),
+                "predicted_label": int(row['Predicted_Label']),
+                "predicted_probability": float(row['Predicted_Probability']),
+                "sector_confidence": float(row['Sector_Confidence']),
+                "sample_confidence": float(row['Sample_Confidence']),
+                "stock_accuracy": float(row['Stock_Accuracy']),
+                "actual_success": int(row['Actual_Success']) if 'Actual_Success' in row and pd.notna(row['Actual_Success']) else None
+            })
+            
+        return Response(results, status=status.HTTP_200_OK)

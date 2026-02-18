@@ -7,16 +7,18 @@ from marketdata.models import Symbol, EodPrice
 from core.pattern_recognition import get_pattern_triggers
 
 class Command(BaseCommand):
-    help = 'Generates Huge NRB Matrix: Weeks (20-104) x Cooldown (20-104)'
+    help = 'Generates NRB Report: Fixed 52 Weeks x Cooldown (20-104)'
 
     def handle(self, *args, **kwargs):
-        self.stdout.write("Starting Huge Matrix NRB Report...")
-        self.stdout.write("Iterating Weeks [20-104] AND Cooldowns [20-104]...")
+        self.stdout.write("Starting NRB Report (Fixed 52 Weeks, Cooldown 20-104)...")
 
         # 1. CONSTANTS
         SECONDS_IN_A_WEEK = 604800.0
         
-        # Base config (Dynamic values will override this)
+        # 🟢 FIXED CONFIG
+        FIXED_WEEKS = 78
+        FIXED_LOOKBACK = 78
+        
         CONFIG = {
             'pattern': "Narrow Range Break",
             'series': "rsc30",       
@@ -34,7 +36,6 @@ class Command(BaseCommand):
                 'sector': sector_name
             }
 
-        # Filter out stocks ending with '_BSE'
         unique_scrips = Symbol.objects.filter(parameter__isnull=False)\
                                       .exclude(symbol__endswith='_BSE')\
                                       .values_list('symbol', flat=True).distinct()
@@ -59,110 +60,102 @@ class Command(BaseCommand):
             price_map = {p['trade_date']: float(p['close']) for p in price_qs}
             sorted_dates = sorted(price_map.keys())
 
-            # 🟢 LOOP 1: Weeks (Lookback) from 20 to 104
-            for n_weeks in range(20, 105):
-                
-                # 🟢 LOOP 2: Cooldown from 20 to 104
-                for cd_weeks in range(20, 105):
-                    try:
-                        # --- A. Get Triggers (Double Dynamic Loops) ---
-                        triggers = get_pattern_triggers(
-                            scrip=scrip,
-                            pattern=CONFIG['pattern'],
-                            nrb_lookback=n_weeks,    # <--- Matches Weeks
-                            weeks=n_weeks,           # <--- Dynamic Weeks
-                            success_rate=CONFIG['success_rate'],
-                            series=CONFIG['series'],
-                            cooldown_weeks=cd_weeks, # <--- Dynamic Cooldown
-                            
-                            # Disable Dip Check for history
-                            dip_threshold_pct=100.0 
-                        )
+            # 🟢 LOOP: Cooldown from 20 to 104 ONLY
+            for cd_weeks in range(20, 105):
+                try:
+                    triggers = get_pattern_triggers(
+                        scrip=scrip,
+                        pattern=CONFIG['pattern'],
+                        nrb_lookback=FIXED_LOOKBACK, # <--- Fixed 52
+                        weeks=FIXED_WEEKS,           # <--- Fixed 52
+                        success_rate=CONFIG['success_rate'],
+                        series=CONFIG['series'],
+                        cooldown_weeks=cd_weeks,     # <--- Dynamic 20-104
+                        dip_threshold_pct=100.0      # Disable dip check
+                    )
 
-                        if not triggers: continue
+                    if not triggers: continue
 
-                        # --- B. GROUP AGGREGATION ---
-                        groups_by_id = {}
+                    # --- B. GROUP AGGREGATION ---
+                    groups_by_id = {}
+                    
+                    for t in triggers:
+                        gid = t.get('nrb_group_id')
+                        if not gid:
+                            gid = f"standalone_{t.get('nrb_id')}"
                         
-                        for t in triggers:
-                            gid = t.get('nrb_group_id')
-                            if not gid:
-                                gid = f"standalone_{t.get('nrb_id')}"
-                            
-                            if gid not in groups_by_id:
-                                groups_by_id[gid] = {
-                                    'group_level': t.get('group_level') or t.get('range_high'),
-                                    'group_start_time': t.get('group_start_time') or t.get('range_start_time'),
-                                    'group_end_time': t.get('group_end_time') or t.get('time'), 
-                                    'nrb_count': t.get('group_nrb_count', 1)
-                                }
+                        if gid not in groups_by_id:
+                            groups_by_id[gid] = {
+                                'group_level': t.get('group_level') or t.get('range_high'),
+                                'group_start_time': t.get('group_start_time') or t.get('range_start_time'),
+                                'group_end_time': t.get('group_end_time') or t.get('time'), 
+                                'nrb_count': t.get('group_nrb_count', 1)
+                            }
 
-                        # --- C. PROCESS GROUPS ---
-                        for gid, group in groups_by_id.items():
-                            
-                            g_start = group['group_start_time']
-                            g_end = group['group_end_time']
-                            
-                            if g_start and g_end:
-                                duration_val = (g_end - g_start) / SECONDS_IN_A_WEEK
-                                duration_weeks = round(duration_val, 1)
-                            else:
-                                duration_weeks = 0
+                    # --- C. PROCESS GROUPS ---
+                    for gid, group in groups_by_id.items():
+                        
+                        g_start = group['group_start_time']
+                        g_end = group['group_end_time']
+                        
+                        if g_start and g_end:
+                            duration_val = (g_end - g_start) / SECONDS_IN_A_WEEK
+                            duration_weeks = round(duration_val, 1)
+                        else:
+                            duration_weeks = 0
 
-                            if not g_end: continue
+                        if not g_end: continue
 
-                            breakout_dt = datetime.fromtimestamp(g_end).date()
-                            start_dt_str = datetime.fromtimestamp(g_start).strftime('%Y-%m-%d') if g_start else "-"
-                            breakout_dt_str = breakout_dt.strftime('%Y-%m-%d')
+                        breakout_dt = datetime.fromtimestamp(g_end).date()
+                        start_dt_str = datetime.fromtimestamp(g_start).strftime('%Y-%m-%d') if g_start else "-"
+                        breakout_dt_str = breakout_dt.strftime('%Y-%m-%d')
 
-                            # Get Price
-                            breakout_price = price_map.get(breakout_dt)
-                            if not breakout_price:
-                                future_dates = [d for d in sorted_dates if d >= breakout_dt]
-                                if future_dates:
-                                    breakout_price = price_map[future_dates[0]]
-                                    breakout_dt = future_dates[0]
-                            
-                            if not breakout_price: continue
+                        breakout_price = price_map.get(breakout_dt)
+                        if not breakout_price:
+                            future_dates = [d for d in sorted_dates if d >= breakout_dt]
+                            if future_dates:
+                                breakout_price = price_map[future_dates[0]]
+                                breakout_dt = future_dates[0]
+                        
+                        if not breakout_price: continue
 
-                            # Returns Calculation
-                            def get_pct_change(start_date, start_val, days):
-                                target_date = start_date + timedelta(days=days)
-                                future_val = next((price_map[d] for d in sorted_dates if d >= target_date), None)
-                                if future_val:
-                                    return round(((future_val - start_val) / start_val) * 100, 2)
-                                return None
+                        # Returns Calculation
+                        def get_pct_change(start_date, start_val, days):
+                            target_date = start_date + timedelta(days=days)
+                            future_val = next((price_map[d] for d in sorted_dates if d >= target_date), None)
+                            if future_val:
+                                return round(((future_val - start_val) / start_val) * 100, 2)
+                            return None
 
-                            succ_3m = get_pct_change(breakout_dt, breakout_price, 90)
-                            succ_6m = get_pct_change(breakout_dt, breakout_price, 180)
-                            succ_9m = get_pct_change(breakout_dt, breakout_price, 270)
-                            succ_12m = get_pct_change(breakout_dt, breakout_price, 365)
+                        succ_3m = get_pct_change(breakout_dt, breakout_price, 90)
+                        succ_6m = get_pct_change(breakout_dt, breakout_price, 180)
+                        succ_9m = get_pct_change(breakout_dt, breakout_price, 270)
+                        succ_12m = get_pct_change(breakout_dt, breakout_price, 365)
 
-                            all_results.append({
-                                "Symbol": scrip,
-                                "Company": sym_info['company'],
-                                "Sector": sym_info['sector'],
-                                "Weeks Setting": n_weeks,       # <--- New Column
-                                "Cooldown Setting": cd_weeks,   # <--- Existing Column
-                                "Start Date": start_dt_str,
-                                "Breakout Date": breakout_dt_str,
-                                "Duration": duration_weeks,
-                                "Breakout Level": group['group_level'],
-                                "Breakout Price": breakout_price,
-                                "3-Month %": succ_3m,
-                                "6-Month %": succ_6m,
-                                "9-Month %": succ_9m,
-                                "12-Month %": succ_12m
-                            })
+                        all_results.append({
+                            "Symbol": scrip,
+                            "Company": sym_info['company'],
+                            "Sector": sym_info['sector'],
+                            "Weeks Setting": FIXED_WEEKS,   # Fixed 52
+                            "Cooldown Setting": cd_weeks,   # Dynamic 20-104
+                            "Start Date": start_dt_str,
+                            "Breakout Date": breakout_dt_str,
+                            "Duration": duration_weeks,
+                            "Breakout Level": group['group_level'],
+                            "Breakout Price": breakout_price,
+                            "3-Month %": succ_3m,
+                            "6-Month %": succ_6m,
+                            "9-Month %": succ_9m,
+                            "12-Month %": succ_12m
+                        })
 
-                    except Exception as e:
-                        continue
+                except Exception as e:
+                    continue
 
         # 4. EXPORT
         if all_results:
             df = pd.DataFrame(all_results)
             
-            # Reorder columns to show Settings first
             cols = ["Symbol", "Company", "Sector", "Weeks Setting", "Cooldown Setting", 
                     "Start Date", "Breakout Date", "Duration", "Breakout Level", 
                     "Breakout Price", "3-Month %", "6-Month %", "9-Month %", "12-Month %"]
@@ -170,20 +163,19 @@ class Command(BaseCommand):
             final_cols = [c for c in cols if c in df.columns]
             df = df[final_cols]
             
-            # Sort order: Weeks -> Cooldown -> Symbol
-            df = df.sort_values(by=['Weeks Setting', 'Cooldown Setting', 'Symbol'], ascending=[True, True, True])
+            # Sort: Cooldown -> Symbol
+            df = df.sort_values(by=['Cooldown Setting', 'Symbol'], ascending=[True, True])
 
-            filename = f"NRB_Matrix_Weeks_20-104_Cooldown_20-104_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+            filename = f"NRB_Cooldown_20-104_Fixed52Weeks_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
             self.stdout.write(f"Saving {len(df)} rows to {filename}...")
             
-            # Safety check for Excel row limit (1,048,576 rows)
             if len(df) > 1000000:
-                self.stdout.write(self.style.WARNING("⚠️ Warning: Data exceeds 1M rows. Switching to CSV to prevent crash."))
+                self.stdout.write(self.style.WARNING("⚠️ Exceeds Excel limit. Switching to CSV."))
                 csv_filename = filename.replace(".xlsx", ".csv")
                 df.to_csv(csv_filename, index=False)
-                self.stdout.write(self.style.SUCCESS(f"Success! Saved as {csv_filename}"))
+                self.stdout.write(self.style.SUCCESS(f"Saved as {csv_filename}"))
             else:
                 df.to_excel(filename, index=False)
-                self.stdout.write(self.style.SUCCESS(f"Success! Saved as {filename}"))
+                self.stdout.write(self.style.SUCCESS(f"Saved as {filename}"))
         else:
             self.stdout.write(self.style.WARNING("No patterns found."))
